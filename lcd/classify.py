@@ -11,9 +11,9 @@ A record is convective if any token in its au, aw, or mw group matches the
 corresponding convective code set (thunderstorm, shower, hail, funnel, or
 squall descriptors). The regime is then:
 
-    convective   p > 0 and convective flag set
-    stratiform   p > 0 and convective flag not set
-    none         p == 0
+    convective   prec > 0 and convective flag set
+    stratiform   prec > 0 and convective flag not set
+    none         prec == 0
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def convective_mask(
 def precip_type(
     df: pd.DataFrame,
     codes: Optional[dict[str, frozenset[str]]] = None,
-    precip_col: str = "p",
+    precip_col: str = "prec",
 ) -> pd.Series:
     """Categorical regime label (convective | stratiform | none) per record."""
     conv = convective_mask(df, codes=codes)
@@ -70,7 +70,7 @@ def precip_type(
 def add_precip_type(
     df: pd.DataFrame,
     codes: Optional[dict[str, frozenset[str]]] = None,
-    precip_col: str = "p",
+    precip_col: str = "prec",
 ) -> pd.DataFrame:
     """Return a copy of ``df`` with a 'prec_type' column added."""
     out = df.copy()

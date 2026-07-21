@@ -1,8 +1,8 @@
 """
 Acquisition and cleaning for NOAA Local Climatological Data.
 
-Provides station selection from the NCEI inventory, concurrent HTTP download
-via a retrying requests session, hourly-only cleaning with SI unit conversion,
+Station selection from the NCEI inventory, concurrent HTTP download via a
+retrying requests session, hourly-only cleaning with SI unit conversion,
 Local Standard Time to UTC conversion, deduplication of (station, time) pairs,
 optional convective classification, and a compressed (station, time) netCDF
 serialization following the CF timeSeries convention.
@@ -14,10 +14,11 @@ import json
 import logging
 import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -68,19 +69,7 @@ class DataNotFoundError(FileNotFoundError):
 
 @dataclass(frozen=True)
 class Region:
-    """Spatial and temporal request envelope.
-
-    Parameters
-    ----------
-    lat_min, lat_max, lon_min, lon_max : float
-        Bounding box in degrees north and degrees east.
-    start_year, end_year : int
-        Inclusive calendar-year range.
-    country : str, optional
-        Two-letter country filter; None disables it.
-    min_year_range : int, default 1
-        Minimum station operating span (END year minus BEGIN year).
-    """
+    """Spatial and temporal request envelope."""
 
     lat_min: float
     lat_max: float
@@ -105,11 +94,7 @@ def select_stations(
     region: Region,
     stations_file: Union[str, Path] = STATIONS_FILE,
 ) -> pd.DataFrame:
-    """Select inventory stations inside a Region.
-
-    Returns a frame with an added ``station_id`` column (USAF + WBAN) and
-    integer ``begin``/``end`` operating years.
-    """
+    """Select inventory stations inside a Region."""
     stations_file = Path(stations_file)
     if not stations_file.exists():
         raise DataNotFoundError(f"Station inventory not found: {stations_file}")
@@ -146,7 +131,7 @@ def _make_session(retries: int = 4, backoff: float = 0.5) -> requests.Session:
         allowed_methods=frozenset({"GET"}),
     )
     session = requests.Session()
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=32)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -187,13 +172,10 @@ def download_stations(
     end_year: int,
     out_dir: Union[str, Path],
     base_url: str = BASE_URL,
-    workers: int = 8,
+    workers: int = 16,
     timeout: float = 60.0,
 ) -> dict[str, int]:
-    """Download every valid (station, year) CSV concurrently.
-
-    Returns a status tally: {'ok': n, 'missing': n, 'error': n}.
-    """
+    """Download every valid (station, year) CSV concurrently."""
     out_dir = Path(out_dir)
     spans = dict(zip(inv["station_id"], zip(inv["begin"], inv["end"])))
 
@@ -222,12 +204,7 @@ def download_stations(
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
-    """Coerce to float, preserving sign and decimals, dropping quality flags.
-
-    Removes any character that is not a digit, dot, or sign (e.g. the 's'
-    suspect flag, '*', or 'M'), retaining negative temperatures rather than
-    stripping the leading minus as digit-only cleaning would.
-    """
+    """Coerce to float, preserving sign and decimals, dropping quality flags."""
     cleaned = series.astype(str).str.replace(r"[^0-9.\-+]", "", regex=True)
     return pd.to_numeric(cleaned.replace({"": np.nan}), errors="coerce")
 
@@ -257,14 +234,15 @@ def _parse_name(name: object) -> tuple[str, str]:
 def _resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
     """Round observation times up to the hour, keeping the best record per hour.
 
-    Among duplicate hours the retained record is the one reporting
-    precipitation and having the fewest missing fields.
+    Times are ceiled to the hour (dt.ceil('h')); among duplicate hours the
+    retained record is the one reporting precipitation and having the fewest
+    missing fields.
     """
     df = df.copy()
     df["time"] = pd.to_datetime(df["time"], format="mixed", errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time")
     df["time"] = df["time"].dt.ceil("h")
-    df["_p_ok"] = df["p"].notnull()
+    df["_p_ok"] = df["prec"].notnull()
     df["_nan"] = df.isnull().sum(axis=1)
     df = df.sort_values(["time", "_p_ok", "_nan"], ascending=[True, True, False])
     df = df.groupby("time").last().reset_index()
@@ -273,7 +251,7 @@ def _resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
 
 def _convert_si(df: pd.DataFrame) -> pd.DataFrame:
     """Apply LCD-to-SI unit conversions in place."""
-    df["p"] = df["p"] * INCH_TO_MM
+    df["prec"] = df["prec"] * INCH_TO_MM
     df["t"] = (df["t"] - 32.0) * (5.0 / 9.0)
     df["dpt"] = (df["dpt"] - 32.0) * (5.0 / 9.0)
     df["ws"] = df["ws"] * MPH_TO_MS
@@ -292,8 +270,7 @@ def lst_to_utc(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"):
 
         offset = round( ((lon + 180) mod 360 - 180) * 24 / 360 )  [hours]
 
-    which is the same mapping used to derive local time from UTC; the inverse
-    is applied here, UTC = LST - offset.
+    and the inverse is applied, UTC = LST - offset.
     """
     lon = df[lon_col].astype(float)
     offset = (((lon + 180.0) % 360.0 - 180.0) * (24.0 / 360.0)).round()
@@ -301,9 +278,26 @@ def lst_to_utc(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"):
     return df
 
 
+def to_local_time(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"):
+    """Convert UTC back to Local Standard Time using the longitude offset.
+
+    Inverse of :func:`lst_to_utc`. With the same longitude offset,
+
+        offset = round( ((lon + 180) mod 360 - 180) * 24 / 360 )  [hours]
+
+    the local standard time is LST = UTC + offset (no daylight saving). This
+    operates on a copy so the passed frame is not modified.
+    """
+    out = df.copy()
+    lon = out[lon_col].astype(float)
+    offset = (((lon + 180.0) % 360.0 - 180.0) * (24.0 / 360.0)).round()
+    out[time_col] = out[time_col] + pd.to_timedelta(offset, unit="h")
+    return out
+
+
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     """Clean one resampled station frame into the base (unclassified) schema."""
-    df["p"] = _clean_precip(df["p"])
+    df["prec"] = _clean_precip(df["prec"])
     for col in ("t", "dpt", "rh", "wd", "ws", "wsg", "sp", "stp", "vis",
                 "lat", "lon", "elev"):
         df[col] = _to_numeric(df[col])
@@ -320,7 +314,7 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df["city"] = names.str[0]
     df["state"] = names.str[1]
 
-    df = df.dropna(subset=["p"])
+    df = df.dropna(subset=["prec"])
     df = lst_to_utc(df)
     return df[list(BASE_COLUMNS)].reset_index(drop=True)
 
@@ -328,11 +322,13 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
 def read_and_clean(
     path: Union[str, Path],
     report_types: frozenset[str] = HOURLY_REPORT_TYPES,
+    months: Optional[Sequence[int]] = None,
 ) -> pd.DataFrame:
     """Read one raw station CSV and return a cleaned hourly frame.
 
     Only schema columns are read; non-hourly summary rows are dropped by
-    report type. Returns an empty schema-shaped frame on any error.
+    report type. When ``months`` is given, only those calendar months (UTC)
+    are retained, which reduces memory during retrieval.
     """
     empty = pd.DataFrame(columns=list(BASE_COLUMNS))
     try:
@@ -344,11 +340,14 @@ def read_and_clean(
 
         if report_types:
             df = df[df["report_type"].isin(report_types)]
-        if df.empty or df["p"].isnull().all():
+        if df.empty or df["prec"].isnull().all():
             return empty
 
         df = _resample_hourly(df)
-        return _clean(df)
+        df = _clean(df)
+        if months is not None and not df.empty:
+            df = df[df["time"].dt.month.isin(list(months))]
+        return df
     except Exception:
         logger.exception("failed to clean %s", path)
         return empty
@@ -359,20 +358,28 @@ def clean_directory(
     report_types: frozenset[str] = HOURLY_REPORT_TYPES,
     workers: int = 8,
     classify: bool = True,
+    months: Optional[Sequence[int]] = None,
 ) -> pd.DataFrame:
-    """Clean every CSV under ``raw_dir``, concatenate, deduplicate, classify.
+    """Clean every CSV under ``raw_dir`` in parallel, dedup, and classify.
 
-    Deduplication keeps one record per (station_id, time); the record with
-    reported precipitation and the fewest missing fields is retained.
+    Cleaning is CPU-bound, so a process pool is used; it falls back to a
+    thread pool if processes are unavailable. Deduplication keeps one record
+    per (station_id, time).
     """
     raw_dir = Path(raw_dir)
-    files = sorted(raw_dir.rglob("*.csv"))
+    files = [str(f) for f in sorted(raw_dir.rglob("*.csv"))]
     if not files:
         raise EmptyDataFrameError(f"No CSV files found under {raw_dir}")
 
     logger.info("Cleaning %d station files", len(files))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        frames = list(pool.map(lambda f: read_and_clean(f, report_types), files))
+    worker = partial(read_and_clean, report_types=report_types, months=months)
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            frames = list(pool.map(worker, files))
+    except Exception:
+        logger.warning("process pool unavailable; using threads")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            frames = list(pool.map(worker, files))
 
     df = pd.concat(frames, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
@@ -380,10 +387,9 @@ def clean_directory(
         df[col] = df[col].astype(np.float32)
     for col in WEATHER_COLUMNS + ("station_id", "city", "state"):
         df[col] = df[col].astype(str)
-    df = df.dropna(subset=["p", "time"])
+    df = df.dropna(subset=["prec", "time"])
 
-    # deduplicate (station, time): prefer precipitating, then fewest NaNs
-    df["_p_ok"] = df["p"].notnull()
+    df["_p_ok"] = df["prec"].notnull()
     df["_nan"] = df[list(MEASURE_COLUMNS)].isnull().sum(axis=1)
     df = df.sort_values(["station_id", "time", "_p_ok", "_nan"],
                         ascending=[True, True, True, False])
@@ -399,26 +405,19 @@ def clean_directory(
 
 # ================================ netCDF I/O ===============================
 
+_PREC_FLAGS: tuple[str, ...] = ("none", "stratiform", "convective")
+
 
 def to_xarray(df: pd.DataFrame) -> xr.Dataset:
-    """Reshape a cleaned frame into a CF timeSeries Dataset.
-
-    Dimensions are (station, time). Latitude, longitude, elevation, city, and
-    state are coordinates along the station dimension. Requires unique
-    (station_id, time) pairs.
-    """
+    """Reshape a cleaned frame into a CF timeSeries Dataset (station, time)."""
     df = df.drop_duplicates(["station_id", "time"])
     stations = np.sort(df["station_id"].unique())
     times = np.sort(df["time"].unique())
 
-    meta = (
-        df.groupby("station_id")[list(COORD_COLUMNS)].first().reindex(stations)
-    )
+    meta = df.groupby("station_id")[list(COORD_COLUMNS)].first().reindex(stations)
 
     ds = xr.Dataset(coords={"station": stations, "time": times})
-    ds = ds.assign_coords(
-        {c: ("station", meta[c].values) for c in COORD_COLUMNS}
-    )
+    ds = ds.assign_coords({c: ("station", meta[c].values) for c in COORD_COLUMNS})
 
     value_cols = [c for c in df.columns
                   if c not in ("station_id", "time", *COORD_COLUMNS)]
@@ -443,17 +442,12 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
     return ds
 
 
-_PREC_FLAGS: tuple[str, ...] = ("none", "stratiform", "convective")
-
-
-def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> None:
+def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> Path:
     """Write a cleaned frame to compressed (station, time) netCDF.
 
-    Measurement fields are stored as compressed float32. The 2D present-weather
-    fields are stored compactly to avoid variable-length-string overhead:
-    ``prec_type`` becomes a CF int8 flag variable, and ``au``/``aw``/``mw``
-    become int16 categorical codes whose lookup tables are stored as a JSON
-    'categories' attribute. Per-station string coordinates are left as-is.
+    The 2D present-weather fields are stored compactly to avoid VLEN string
+    overhead: ``prec_type`` becomes a CF int8 flag variable, and au/aw/mw
+    become int16 categorical codes with a JSON 'categories' attribute.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -493,15 +487,11 @@ def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> None:
             encoding[name] = {"zlib": True, "complevel": 4, "dtype": "float32"}
 
     ds.to_netcdf(path, engine="netcdf4", encoding=encoding)
+    return path
 
 
-def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
-    """Read a (station, time) netCDF written by :func:`to_netcdf` into a frame.
-
-    Reverses the compact encoding of ``prec_type`` (int8 flags) and
-    ``au``/``aw``/``mw`` (int16 categorical codes) back to strings, then drops
-    the empty (station, time) padding cells.
-    """
+def open_xarray(path: Union[str, Path]) -> xr.Dataset:
+    """Open a stored netCDF and decode the compact fields back to strings."""
     with xr.open_dataset(path, engine="netcdf4") as ds:
         ds = ds.load()
 
@@ -509,12 +499,21 @@ def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
         meanings = np.array(ds["prec_type"].attrs["flag_meanings"].split(),
                             dtype=object)
         ds["prec_type"] = (ds["prec_type"].dims, meanings[ds["prec_type"].values])
+        ds["prec_type"].attrs["long_name"] = variable_attrs("prec_type").get(
+            "long_name", ""
+        )
 
     for col in WEATHER_COLUMNS:
         if col in ds and "categories" in ds[col].attrs:
             cats = np.array(json.loads(ds[col].attrs["categories"]), dtype=object)
             ds[col] = (ds[col].dims, cats[ds[col].values])
+            ds[col].attrs["long_name"] = variable_attrs(col).get("long_name", "")
+    return ds
 
+
+def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
+    """Read a (station, time) netCDF into a long frame with padding removed."""
+    ds = open_xarray(path)
     df = ds.to_dataframe().reset_index().rename(columns={"station": "station_id"})
     for col in STRING_COLUMNS:
         if col in df.columns:
@@ -522,7 +521,7 @@ def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
                 lambda v: v.decode() if isinstance(v, bytes) else v
             )
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["p"])  # drop (station, time) padding cells
+    df = df.dropna(subset=["prec"])  # drop (station, time) padding cells
     cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
     return df[cols].sort_values(["time", "lat", "lon"]).reset_index(drop=True)
 
@@ -538,34 +537,10 @@ def build(
     raw_dir: Optional[Union[str, Path]] = None,
     workers: int = 8,
     classify: bool = True,
+    months: Optional[Sequence[int]] = None,
     keep_raw: bool = False,
 ) -> pd.DataFrame:
-    """Select, download, clean, and optionally serialize LCD records.
-
-    Parameters
-    ----------
-    region : Region
-        Spatial and temporal request envelope.
-    output : str or Path, optional
-        Destination netCDF path. If None, nothing is written.
-    stations_file : str or Path
-        NCEI station inventory.
-    base_url : str
-        Data endpoint (override for testing or mirrors).
-    raw_dir : str or Path, optional
-        Directory for raw downloads. If None, a node-local temporary directory
-        under /tmp is used and removed unless ``keep_raw``.
-    workers : int, default 8
-        Concurrency for download and cleaning.
-    classify : bool, default True
-        Add a 'prec_type' column via :mod:`lcd.classify`.
-    keep_raw : bool, default False
-        Retain the raw CSVs after cleaning.
-
-    Returns
-    -------
-    pandas.DataFrame
-    """
+    """Select, download, clean, and optionally serialize LCD records."""
     inv = select_stations(region, stations_file)
     if inv.empty:
         raise EmptyDataFrameError("No stations match the requested region.")
@@ -576,9 +551,11 @@ def build(
     try:
         download_stations(
             inv, region.start_year, region.end_year, raw_dir,
-            base_url=base_url, workers=workers,
+            base_url=base_url, workers=max(workers, 16),
         )
-        df = clean_directory(raw_dir, workers=workers, classify=classify)
+        df = clean_directory(
+            raw_dir, workers=workers, classify=classify, months=months
+        )
     finally:
         if made_tmp and not keep_raw:
             shutil.rmtree(raw_dir, ignore_errors=True)

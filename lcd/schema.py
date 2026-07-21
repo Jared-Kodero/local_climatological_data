@@ -18,11 +18,13 @@ from pathlib import Path
 
 # ----------------------------------------------------------------- Endpoints
 
-HOME = Path.home()
 TMP = Path("/tmp")  # node-local scratch
 
+# Packaged station inventory (lcd/data/airports.stations).
+DATA_DIR = Path(__file__).resolve().parent / "data"
+STATIONS_FILE = DATA_DIR / "airports.stations"
+
 BASE_URL = "https://www.ncei.noaa.gov/data/local-climatological-data/access"
-STATIONS_FILE = HOME / "research/scripts/noaa/airports.stations"
 
 # ----------------------------------------------------- Raw -> internal names
 
@@ -58,16 +60,7 @@ COORD_COLUMNS: tuple[str, ...] = ("lat", "lon", "elev", "city", "state")
 
 # Numeric measurement columns carried as float32.
 MEASURE_COLUMNS: tuple[str, ...] = (
-    "t",
-    "dpt",
-    "rh",
-    "wd",
-    "ws",
-    "wsg",
-    "sp",
-    "stp",
-    "vis",
-    "pr",
+    "t", "dpt", "rh", "wd", "ws", "wsg", "sp", "stp", "vis", "prec",
 )
 
 # Present-weather groups retained verbatim for user-defined classification.
@@ -104,7 +97,7 @@ UNITS: dict[str, str] = {
     "sp": "hPa",
     "stp": "hPa",
     "vis": "km",
-    "p": "mm/hr",
+    "prec": "mm/hr",
 }
 
 LONG_NAMES: dict[str, str] = {
@@ -124,7 +117,7 @@ LONG_NAMES: dict[str, str] = {
     "sp": "Sea Level Pressure",
     "stp": "Station Pressure",
     "vis": "Horizontal Visibility",
-    "p": "Hourly Precipitation Intensity",
+    "prec": "Hourly Precipitation Intensity",
     "au": "Automated Present Weather (AU group)",
     "aw": "Automated Present Weather (AW group)",
     "mw": "Manual Present Weather (MW group)",
@@ -132,10 +125,10 @@ LONG_NAMES: dict[str, str] = {
 }
 
 # Conversions from LCD reporting units to SI.
-TRACE_INCHES = 0.005  # documented trace value
+TRACE_INCHES = 0.005          # documented trace value
 INCH_TO_MM = 25.4
 MPH_TO_MS = 0.44704
-INHG_TO_HPA = 33.8639  # 1 inHg = 33.8639 hPa
+INHG_TO_HPA = 33.8639         # 1 inHg = 33.8639 hPa
 MILE_TO_KM = 1.609344
 
 # --------------------------------------------------- Convective classification

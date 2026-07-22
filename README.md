@@ -24,19 +24,16 @@ inventory ships in `lcd/data/airports.stations`.
 ```python
 import lcd
 
-path = lcd.get_lcd_from_noaa(
+ds = lcd.get_lcd_from_noaa(
     lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
     min_year=1980, max_year=2024,
     months=[6, 7, 8],           # optional calendar-month filter (UTC)
     classify_convective=True,   # adds a 'prec_type' column
-    as_netcdf=True,             # returns the .nc path; False returns a DataFrame
+
 )
 ```
 
-With `as_netcdf=True` the cleaned records are written to a compressed
-`(station, time)` netCDF and the file path is returned. With `as_netcdf=False`
-the cleaned `pandas.DataFrame` is returned. Retrieval downloads concurrently
-and cleans in parallel across processes.
+
 
 ### open_dataset
 

@@ -14,7 +14,7 @@ import json
 import logging
 import shutil
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -28,6 +28,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from . import classify as _classify
+from .progress import Progress
 from .schema import (
     BASE_COLUMNS,
     BASE_URL,
@@ -188,13 +189,15 @@ def download_stations(
     logger.info("Downloading %d station-year files", len(jobs))
     session = _make_session()
     tally = {"ok": 0, "missing": 0, "error": 0}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_download_one, session, base_url, y, sid, out_dir, timeout)
-            for y, sid in jobs
-        ]
-        for fut in futures:
-            tally[fut.result()] += 1
+    with Progress(len(jobs), description="Downloading LCD") as bar:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_download_one, session, base_url, y, sid, out_dir, timeout)
+                for y, sid in jobs
+            ]
+            for fut in as_completed(futures):
+                tally[fut.result()] += 1
+                bar.advance()
 
     logger.info("Download tally: %s", tally)
     return tally
@@ -374,12 +377,20 @@ def clean_directory(
     logger.info("Cleaning %d station files", len(files))
     worker = partial(read_and_clean, report_types=report_types, months=months)
     try:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            frames = list(pool.map(worker, files))
+        with Progress(len(files), description="Cleaning LCD") as bar:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                frames = []
+                for frame in pool.map(worker, files):
+                    frames.append(frame)
+                    bar.advance()
     except Exception:
         logger.warning("process pool unavailable; using threads")
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            frames = list(pool.map(worker, files))
+        with Progress(len(files), description="Cleaning LCD") as bar:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                frames = []
+                for frame in pool.map(worker, files):
+                    frames.append(frame)
+                    bar.advance()
 
     df = pd.concat(frames, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")

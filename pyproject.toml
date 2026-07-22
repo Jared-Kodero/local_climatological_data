@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cities = ["cartopy>=0.22"]
+progress = ["rich>=13.0"]
 
 [project.urls]
 Repository = "https://github.com/Jared-Kodero/local_climatological_data"

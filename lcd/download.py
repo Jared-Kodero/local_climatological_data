@@ -14,9 +14,10 @@ import json
 import logging
 import shutil
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import partial
+from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -28,7 +29,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from . import classify as _classify
-from .progress import Progress
+from .progress import SerialProgressBar
 from .schema import (
     BASE_COLUMNS,
     BASE_URL,
@@ -103,9 +104,8 @@ def select_stations(
     inv = pd.read_csv(stations_file, header=0)
     inv[["LAT", "LON"]] = inv[["LAT", "LON"]].astype(float)
 
-    mask = (
-        inv["LAT"].between(region.lat_min, region.lat_max)
-        & inv["LON"].between(region.lon_min, region.lon_max)
+    mask = inv["LAT"].between(region.lat_min, region.lat_max) & inv["LON"].between(
+        region.lon_min, region.lon_max
     )
     if region.country is not None:
         mask &= inv["CTRY"] == region.country
@@ -167,6 +167,18 @@ def _download_one(
         return "error"
 
 
+def _download_job(
+    job: tuple[int, str],
+    session: requests.Session,
+    base_url: str,
+    out_dir: Path,
+    timeout: float,
+) -> str:
+    """imap_unordered worker: unpack (year, station_id) and download."""
+    year, sid = job
+    return _download_one(session, base_url, year, sid, out_dir, timeout)
+
+
 def download_stations(
     inv: pd.DataFrame,
     start_year: int,
@@ -176,7 +188,12 @@ def download_stations(
     workers: int = 16,
     timeout: float = 60.0,
 ) -> dict[str, int]:
-    """Download every valid (station, year) CSV concurrently."""
+    """Download every valid (station, year) CSV concurrently.
+
+    Uses a thread-backed multiprocessing pool with ``imap_unordered`` so the
+    shared requests session is reused and progress advances as each file
+    finishes.
+    """
     out_dir = Path(out_dir)
     spans = dict(zip(inv["station_id"], zip(inv["begin"], inv["end"])))
 
@@ -188,16 +205,20 @@ def download_stations(
 
     logger.info("Downloading %d station-year files", len(jobs))
     session = _make_session()
+    worker = partial(
+        _download_job,
+        session=session,
+        base_url=base_url,
+        out_dir=out_dir,
+        timeout=timeout,
+    )
     tally = {"ok": 0, "missing": 0, "error": 0}
-    with Progress(len(jobs), description="Downloading LCD") as bar:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_download_one, session, base_url, y, sid, out_dir, timeout)
-                for y, sid in jobs
-            ]
-            for fut in as_completed(futures):
-                tally[fut.result()] += 1
-                bar.advance()
+    with ThreadPool(processes=max(1, workers)) as pool:
+        results = pool.imap_unordered(worker, jobs)
+        for status in SerialProgressBar(
+            results, total=len(jobs), description="Downloading LCD"
+        ):
+            tally[status] += 1
 
     logger.info("Download tally: %s", tally)
     return tally
@@ -301,8 +322,20 @@ def to_local_time(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
     """Clean one resampled station frame into the base (unclassified) schema."""
     df["prec"] = _clean_precip(df["prec"])
-    for col in ("t", "dpt", "rh", "wd", "ws", "wsg", "sp", "stp", "vis",
-                "lat", "lon", "elev"):
+    for col in (
+        "t",
+        "dpt",
+        "rh",
+        "wd",
+        "ws",
+        "wsg",
+        "sp",
+        "stp",
+        "vis",
+        "lat",
+        "lon",
+        "elev",
+    ):
         df[col] = _to_numeric(df[col])
 
     df = _convert_si(df)
@@ -377,20 +410,18 @@ def clean_directory(
     logger.info("Cleaning %d station files", len(files))
     worker = partial(read_and_clean, report_types=report_types, months=months)
     try:
-        with Progress(len(files), description="Cleaning LCD") as bar:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                frames = []
-                for frame in pool.map(worker, files):
-                    frames.append(frame)
-                    bar.advance()
+        with Pool(processes=max(1, workers)) as pool:
+            results = pool.imap_unordered(worker, files)
+            frames = list(
+                SerialProgressBar(results, total=len(files), description="Cleaning LCD")
+            )
     except Exception:
         logger.warning("process pool unavailable; using threads")
-        with Progress(len(files), description="Cleaning LCD") as bar:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                frames = []
-                for frame in pool.map(worker, files):
-                    frames.append(frame)
-                    bar.advance()
+        with ThreadPool(processes=max(1, workers)) as pool:
+            results = pool.imap_unordered(worker, files)
+            frames = list(
+                SerialProgressBar(results, total=len(files), description="Cleaning LCD")
+            )
 
     df = pd.concat(frames, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
@@ -402,8 +433,9 @@ def clean_directory(
 
     df["_p_ok"] = df["prec"].notnull()
     df["_nan"] = df[list(MEASURE_COLUMNS)].isnull().sum(axis=1)
-    df = df.sort_values(["station_id", "time", "_p_ok", "_nan"],
-                        ascending=[True, True, True, False])
+    df = df.sort_values(
+        ["station_id", "time", "_p_ok", "_nan"], ascending=[True, True, True, False]
+    )
     df = df.drop_duplicates(["station_id", "time"], keep="last")
     df = df.drop(columns=["_p_ok", "_nan"])
 
@@ -419,29 +451,60 @@ def clean_directory(
 _PREC_FLAGS: tuple[str, ...] = ("none", "stratiform", "convective")
 
 
+def _is_float_dtype(dtype) -> bool:
+    """np.issubdtype guarded against pandas extension dtypes (e.g. StringDtype)."""
+    try:
+        return bool(np.issubdtype(dtype, np.floating))
+    except TypeError:
+        return False
+
+
+def _is_datetime_dtype(dtype) -> bool:
+    try:
+        return bool(np.issubdtype(dtype, np.datetime64))
+    except TypeError:
+        return pd.api.types.is_datetime64_any_dtype(dtype)
+
+
 def to_xarray(df: pd.DataFrame) -> xr.Dataset:
     """Reshape a cleaned frame into a CF timeSeries Dataset (station, time)."""
-    df = df.drop_duplicates(["station_id", "time"])
-    stations = np.sort(df["station_id"].unique())
+    df = df.drop_duplicates(["station_id", "time"]).copy()
+
+    # Coerce pandas string / extension columns to numpy object so xarray and
+    # netCDF see plain arrays (newer pandas defaults strings to StringDtype,
+    # which numpy.issubdtype cannot interpret).
+    for col in STRING_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].astype(object)
+
+    stations = np.asarray(df["station_id"].unique(), dtype=object)
+    stations.sort()
     times = np.sort(df["time"].unique())
 
     meta = df.groupby("station_id")[list(COORD_COLUMNS)].first().reindex(stations)
 
     ds = xr.Dataset(coords={"station": stations, "time": times})
-    ds = ds.assign_coords({c: ("station", meta[c].values) for c in COORD_COLUMNS})
+    for c in COORD_COLUMNS:
+        values = meta[c].values
+        if c in STRING_COLUMNS:
+            values = np.asarray(values, dtype=object)
+        ds = ds.assign_coords({c: ("station", values)})
 
-    value_cols = [c for c in df.columns
-                  if c not in ("station_id", "time", *COORD_COLUMNS)]
+    value_cols = [
+        c for c in df.columns if c not in ("station_id", "time", *COORD_COLUMNS)
+    ]
     for col in value_cols:
-        pivot = (
-            df.pivot(index="station_id", columns="time", values=col)
-            .reindex(index=stations, columns=times)
+        pivot = df.pivot(index="station_id", columns="time", values=col).reindex(
+            index=stations, columns=times
         )
-        ds[col] = (("station", "time"), pivot.values)
+        values = pivot.values
+        if col in STRING_COLUMNS:
+            values = np.asarray(values, dtype=object)
+        ds[col] = (("station", "time"), values)
 
     for name in ds.variables:
         attrs = variable_attrs(str(name))
-        if np.issubdtype(ds[name].dtype, np.datetime64):
+        if _is_datetime_dtype(ds[name].dtype):
             attrs.pop("units", None)  # CF datetime encoding owns 'units'
         ds[name].attrs.update(attrs)
     ds.attrs.update(
@@ -494,11 +557,11 @@ def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> Path:
         encoding[col] = {"zlib": True, "complevel": 4}
 
     for name, var in ds.data_vars.items():
-        if np.issubdtype(var.dtype, np.floating):
+        if _is_float_dtype(var.dtype):
             encoding[name] = {"zlib": True, "complevel": 4, "dtype": "float32"}
 
     ds.to_netcdf(path, engine="netcdf4", encoding=encoding)
-    return path
+    return ds
 
 
 def open_xarray(path: Union[str, Path]) -> xr.Dataset:
@@ -507,8 +570,9 @@ def open_xarray(path: Union[str, Path]) -> xr.Dataset:
         ds = ds.load()
 
     if "prec_type" in ds and "flag_meanings" in ds["prec_type"].attrs:
-        meanings = np.array(ds["prec_type"].attrs["flag_meanings"].split(),
-                            dtype=object)
+        meanings = np.array(
+            ds["prec_type"].attrs["flag_meanings"].split(), dtype=object
+        )
         ds["prec_type"] = (ds["prec_type"].dims, meanings[ds["prec_type"].values])
         ds["prec_type"].attrs["long_name"] = variable_attrs("prec_type").get(
             "long_name", ""
@@ -528,9 +592,7 @@ def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
     df = ds.to_dataframe().reset_index().rename(columns={"station": "station_id"})
     for col in STRING_COLUMNS:
         if col in df.columns:
-            df[col] = df[col].apply(
-                lambda v: v.decode() if isinstance(v, bytes) else v
-            )
+            df[col] = df[col].apply(lambda v: v.decode() if isinstance(v, bytes) else v)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["prec"])  # drop (station, time) padding cells
     cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
@@ -558,15 +620,19 @@ def build(
     logger.info("Selected %d stations", len(inv))
 
     made_tmp = raw_dir is None
-    raw_dir = Path(tempfile.mkdtemp(prefix="lcd_", dir=TMP)) if made_tmp else Path(raw_dir)
+    raw_dir = (
+        Path(tempfile.mkdtemp(prefix="lcd_", dir=TMP)) if made_tmp else Path(raw_dir)
+    )
     try:
         download_stations(
-            inv, region.start_year, region.end_year, raw_dir,
-            base_url=base_url, workers=max(workers, 16),
+            inv,
+            region.start_year,
+            region.end_year,
+            raw_dir,
+            base_url=base_url,
+            workers=max(workers, 16),
         )
-        df = clean_directory(
-            raw_dir, workers=workers, classify=classify, months=months
-        )
+        df = clean_directory(raw_dir, workers=workers, classify=classify, months=months)
     finally:
         if made_tmp and not keep_raw:
             shutil.rmtree(raw_dir, ignore_errors=True)

@@ -16,7 +16,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from . import download as _dl
 from .cities import add_city_names
 from .download import (
     DataNotFoundError,
@@ -50,6 +49,7 @@ def get_lcd_from_noaa(
     classify_convective: bool = True,
     as_netcdf: bool = True,
     *,
+    as_dataframe: bool = False,
     output: Optional[Union[str, Path]] = None,
     country: Optional[str] = "US",
     min_year_range: int = 1,
@@ -86,12 +86,23 @@ def get_lcd_from_noaa(
     pathlib.Path or pandas.DataFrame
     """
     region = Region(
-        lat_min, lat_max, lon_min, lon_max, min_year, max_year,
-        country=country, min_year_range=min_year_range,
+        lat_min,
+        lat_max,
+        lon_min,
+        lon_max,
+        min_year,
+        max_year,
+        country=country,
+        min_year_range=min_year_range,
     )
     df = build(
-        region, output=None, stations_file=stations_file, base_url=base_url,
-        workers=workers, classify=classify_convective, months=months,
+        region,
+        output=None,
+        stations_file=stations_file,
+        base_url=base_url,
+        workers=workers,
+        classify=classify_convective,
+        months=months,
         keep_raw=keep_raw,
     )
     if add_cities:

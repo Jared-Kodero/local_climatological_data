@@ -47,43 +47,85 @@ def get_lcd_from_noaa(
     max_year: int,
     months: Optional[Sequence[int]] = None,
     classify_convective: bool = True,
-    as_netcdf: bool = True,
+    engine: Literal["pandas", "netcdf"] = "netcdf",
     *,
-    as_dataframe: bool = False,
-    output: Optional[Union[str, Path]] = None,
     country: Optional[str] = "US",
     min_year_range: int = 1,
     stations_file: Union[str, Path] = STATIONS_FILE,
     base_url: str = BASE_URL,
     workers: int = 8,
+    scheduler: Literal["processes", "threads"] = "processes",
     add_cities: bool = False,
     keep_raw: bool = False,
-) -> Union[Path, pd.DataFrame]:
-    """Download, clean, and return LCD records for a region and year range.
+) -> xr.Dataset | pd.DataFrame:
+    """Retrieve NOAA Local Climatological Data for a geographic region.
+
+    Download station-year LCD files from NOAA, clean and subset the hourly
+    observations, and return the result as either a pandas DataFrame or an
+    xarray Dataset. Records are restricted by geographic bounds, calendar
+    years, country, and optionally calendar month.
 
     Parameters
     ----------
-    lon_min, lon_max, lat_min, lat_max : float
-        Bounding box in degrees east and degrees north.
+    lon_min, lon_max : float
+        Western and eastern longitude bounds, respectively, in decimal
+        degrees east. Longitudes west of the prime meridian are negative.
+    lat_min, lat_max : float
+        Southern and northern latitude bounds, respectively, in decimal
+        degrees north.
     min_year, max_year : int
-        Inclusive calendar-year range.
+        First and last calendar years to include. Both bounds are inclusive.
     months : sequence of int, optional
-        Retain only these calendar months (UTC). Applied during cleaning to
-        reduce memory.
+        Calendar months to retain, expressed as integers from 1 through 12.
+        Filtering is applied during data cleaning to reduce memory use. If
+        None, retain all months.
     classify_convective : bool, default True
-        Add a 'prec_type' column via :mod:`lcd.classify`.
-    as_netcdf : bool, default True
-        If True, write a compressed (station, time) netCDF and return its path.
-        If False, return the cleaned DataFrame.
-    output : str or Path, optional
-        Destination netCDF path when ``as_netcdf`` is True. Defaults to a name
-        built from the bounding box and years in the working directory.
+        Whether to classify precipitation observations and add the resulting
+        ``prec_type`` variable or column.
+    engine : {"pandas", "netcdf"}, default "netcdf"
+        Output representation. ``"pandas"`` returns a
+        :class:`pandas.DataFrame`; ``"netcdf"`` converts the cleaned records
+        to an :class:`xarray.Dataset`.
+    outfile : str or pathlib.Path, optional
+        Output path. For the pandas engine, the data are written as CSV using
+        a ``.csv`` suffix. For the netCDF engine, this path is passed to the
+        netCDF conversion routine. Parent directories are created
+        automatically. If None, no CSV file is written.
+    country : str, optional, default "US"
+        Country code used to restrict the station inventory. Set to None to
+        disable country filtering.
+    min_year_range : int, default 1
+        Minimum number of years for which a station must satisfy the requested
+        temporal coverage criteria.
+    stations_file : str or pathlib.Path, default STATIONS_FILE
+        Path to the station inventory used to identify stations within the
+        requested region.
+    base_url : str, default BASE_URL
+        Base URL from which NOAA LCD station-year files are downloaded.
+    workers : int, default 8
+        Maximum number of concurrent workers used for downloading and cleaning.
+        Values less than one are treated as one worker.
+    scheduler : {"processes", "threads"}, default "processes"
+        Dask scheduler used for parallel data-cleaning tasks.
     add_cities : bool, default False
-        Assign 'city' and 'state' from Natural Earth via cartopy.
+        Whether to add ``city`` and ``state`` fields based on the station
+        coordinates.
+    keep_raw : bool, default False
+        Whether to retain downloaded source files after processing.
 
     Returns
     -------
-    pathlib.Path or pandas.DataFrame
+    pandas.DataFrame
+        Cleaned LCD observations when ``engine="pandas"``.
+    xarray.Dataset
+        Cleaned LCD observations converted to an xarray Dataset when
+        ``engine="netcdf"``.
+
+    Notes
+    -----
+    The function may perform network requests and create files or directories
+    on disk. Temporal filtering is applied after station selection and during
+    cleaning of the downloaded observations.
     """
     region = Region(
         lat_min,
@@ -97,25 +139,18 @@ def get_lcd_from_noaa(
     )
     df = build(
         region,
-        output=None,
         stations_file=stations_file,
         base_url=base_url,
         workers=workers,
         classify=classify_convective,
         months=months,
         keep_raw=keep_raw,
+        scheduler=scheduler,
     )
     if add_cities:
         df = add_city_names(df)
 
-    if not as_netcdf:
-        return df
-
-    if output is None:
-        output = Path(
-            f"lcd_{lat_min}_{lat_max}_{lon_min}_{lon_max}_{min_year}_{max_year}.nc"
-        )
-    return to_netcdf(df, output)
+    return to_netcdf(df, engine)
 
 
 # ---------------------------------------------------------------- Loading

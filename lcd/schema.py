@@ -60,7 +60,16 @@ COORD_COLUMNS: tuple[str, ...] = ("lat", "lon", "elev", "city", "state")
 
 # Numeric measurement columns carried as float32.
 MEASURE_COLUMNS: tuple[str, ...] = (
-    "t", "dpt", "rh", "wd", "ws", "wsg", "sp", "stp", "vis", "prec",
+    "t",
+    "dpt",
+    "rh",
+    "wd",
+    "ws",
+    "wsg",
+    "sp",
+    "stp",
+    "vis",
+    "prec",
 )
 
 # Present-weather groups retained verbatim for user-defined classification.
@@ -73,9 +82,7 @@ BASE_COLUMNS: tuple[str, ...] = (
 )
 OUTPUT_COLUMNS: tuple[str, ...] = BASE_COLUMNS + ("prec_type",)
 
-STRING_COLUMNS: tuple[str, ...] = (
-    ("station_id", "city", "state") + WEATHER_COLUMNS + ("prec_type",)
-)
+STRING_COLUMNS: tuple[str, ...] = ("city", "state") + WEATHER_COLUMNS + ("prec_type",)
 
 # Columns eligible for within-day lagging (CAPE originates from ERA5 and is
 # only present after an external merge).
@@ -125,10 +132,10 @@ LONG_NAMES: dict[str, str] = {
 }
 
 # Conversions from LCD reporting units to SI.
-TRACE_INCHES = 0.005          # documented trace value
+TRACE_INCHES = 0.005  # documented trace value
 INCH_TO_MM = 25.4
 MPH_TO_MS = 0.44704
-INHG_TO_HPA = 33.8639         # 1 inHg = 33.8639 hPa
+INHG_TO_HPA = 33.8639  # 1 inHg = 33.8639 hPa
 MILE_TO_KM = 1.609344
 
 # --------------------------------------------------- Convective classification

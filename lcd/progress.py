@@ -1,146 +1,209 @@
 """
-Progress reporting for long-running download and cleaning loops.
+Progress reporting for serial and pool-driven loops.
 
-An interactive session (Jupyter kernel or a TTY) gets a ``rich`` progress bar;
-a non-interactive session (log file, batch job) gets a thread-safe milestone
-emitter that writes percentages in place and reports elapsed time on
-completion. ``rich`` is optional; without it the milestone emitter is used
-everywhere.
+Interactive sessions (ipykernel or a TTY) render a rich progress bar;
+non-interactive streams receive milestone percentages at ``step_pct``
+intervals with an elapsed-time summary on completion.
+
+Requires (for the interactive bar):
+    pip install rich
 """
 
 from __future__ import annotations
 
+import datetime
+import logging
 import sys
 import threading
-import time
-from types import TracebackType
-from typing import IO, Optional, Type
+from typing import Any, Iterable, Iterator, Optional
 
 
-def _format_elapsed(seconds: float) -> str:
-    """Human-readable elapsed time (e.g. '3.2s', '1m 04s', '1h 02m')."""
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    if seconds < 3600:
-        m, s = divmod(int(seconds), 60)
-        return f"{m}m {s:02d}s"
-    h, rem = divmod(int(seconds), 3600)
-    m = rem // 60
-    return f"{h}h {m:02d}m"
+class SerialProgressBar:
+    """
+    Serial-loop progress reporter behavior.
 
+    Interactive sessions (ipykernel or tty) render a rich progress bar.
+    Non-tty streams receive milestone percentages at step_pct intervals.
 
-class Progress:
-    """Context-managed progress reporter with a ``rich`` or milestone backend.
-
-    Parameters
-    ----------
-    total : int
-        Number of work items.
-    description : str
-        Label shown alongside the bar or milestones.
-    step_pct : int, default 5
-        Milestone spacing for the non-interactive emitter.
-    stream : IO[str], optional
-        Output stream (defaults to stdout).
+    Requires:
+        pip install rich
     """
 
     def __init__(
         self,
-        total: int,
+        iterable: Optional[Iterable] = None,
+        total: Optional[int] = None,
         description: str = "",
-        step_pct: int = 5,
-        stream: Optional[IO[str]] = None,
+        transient: bool = False,
+        refresh_per_second: int = 10,
+        step_pct: int = 10,
+        stdout: Any = None,
     ) -> None:
-        self._total = int(total)
+        self.iterable = iterable
         self.description = description
-        self.step_pct = max(1, int(step_pct))
-        self._stream = stream if stream is not None else sys.stdout
+        self.transient = transient
+        self.refresh_per_second = refresh_per_second
+
+        if total is not None:
+            self._total = total
+        elif iterable is not None and hasattr(iterable, "__len__"):
+            self._total = len(iterable)
+        else:
+            self._total = 0
 
         self._completed = 0
+        self._progress = None
+        self._task_id = None
+
+        self._isatty = sys.stdout.isatty()
+        self._interactive = "ipykernel" in sys.modules or self._isatty
+        self._stream = stdout or sys.stdout
         self._last_emitted = -1
         self._lock = threading.Lock()
-        self._start: Optional[float] = None
-        self._elapsed: Optional[float] = None
+        self._wrote_header = False
+        self._logging_true = logging.getLogger().hasHandlers()
+        self._started = False
+        self._start_time = datetime.datetime.now()
+        self._elapsed = None
+        self.step_pct = 1 if self._isatty else step_pct
 
-        isatty = getattr(self._stream, "isatty", lambda: False)()
-        self._interactive = ("ipykernel" in sys.modules) or bool(isatty)
-        self._rich = None
-        self._task = None
+    def _interactive_start(self) -> None:
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            TaskProgressColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
 
-    # ------------------------------------------------------------- context
-
-    def __enter__(self) -> Progress:
-        self._start = time.monotonic()
-        if self._interactive:
-            self._rich = self._make_rich()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
-    ) -> bool:
-        if self._rich is not None:
-            self._rich.stop()
-        return False
-
-    # -------------------------------------------------------------- update
-
-    def advance(self, n: int = 1) -> None:
-        """Advance the counter by ``n`` and refresh the display."""
-        if self._rich is not None:
-            self._rich.advance(self._task, n)
-            return
-        with self._lock:
-            self._completed += n
-            completed = self._completed
-        self._emit_pct(completed)
-
-    # ------------------------------------------------------------ backends
-
-    def _make_rich(self):
-        try:
-            from rich.progress import (
-                BarColumn,
-                TaskProgressColumn,
-                TextColumn,
-                TimeElapsedColumn,
-            )
-            from rich.progress import (
-                Progress as RichProgress,
-            )
-        except Exception:
-            return None
-        bar = RichProgress(
+        self._progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
-            TextColumn("{task.completed}/{task.total}"),
             TimeElapsedColumn(),
-            transient=False,
+            transient=self.transient,
+            refresh_per_second=self.refresh_per_second,
         )
-        bar.start()
-        self._task = bar.add_task(self.description, total=self._total)
-        return bar
+        self._progress.start()
+        self._task_id = self._progress.add_task(
+            self.description,
+            total=self._total if self._total > 0 else None,
+        )
 
-    def _emit_pct(self, completed: int) -> None:
-        """Write the current milestone in place, no newline until completion."""
+    def _fd_start(self) -> None:
+        self._last_emitted = -1
         if self._total == 0:
             return
-        pct = (100 * completed) // self._total
+        with self._lock:
+            if not self._wrote_header:
+                self.description = self.description or "Progress"
+                dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                prefix = "" if not self._logging_true else f"{dt} - PROGRESS - INFO - "
+                print(
+                    f"{prefix}{self.description} : ",
+                    end=" ",
+                    file=self._stream,
+                    flush=True,
+                )
+                self._wrote_header = True
+
+    def _start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        if self._interactive:
+            self._interactive_start()
+        elif not self._isatty:
+            self._fd_start()
+
+    def _elapsed_time(self):
+        elapsed = datetime.datetime.now() - self._start_time
+        total_seconds = elapsed.total_seconds()
+
+        if total_seconds < 1:
+            self._elapsed = f"{total_seconds * 1000:.0f} ms"
+            return self._elapsed
+
+        total_seconds = int(round(total_seconds))
+
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(rem, 60)
+
+        self._elapsed = f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    def _emit_pct(self) -> None:
+        if self._total == 0:
+            return
+        pct = (100 * self._completed) // self._total
         milestone = (pct // self.step_pct) * self.step_pct
         with self._lock:
             if milestone <= self._last_emitted:
                 return
-            self._last_emitted = milestone
 
+            self._last_emitted = milestone
             end_char = "\n" if milestone >= 100 else " "
-            if milestone >= 100 and self._start is not None:
-                self._elapsed = time.monotonic() - self._start
-                label = f"{self.description} " if self.description else ""
-                msg = f"{label}{milestone}% [Finished in: {_format_elapsed(self._elapsed)}]"
+
+            self._elapsed_time()
+            if milestone >= 100 and self._elapsed is not None:
+                msg = f"{milestone}% [Finished in: {self._elapsed}]"
             else:
                 msg = f"{milestone}%"
 
             print(msg, end=end_char, file=self._stream, flush=True)
+
+    def update(self, n: int = 1) -> None:
+        """Advance the counter by n steps."""
+        self._completed += n
+        if self._interactive:
+            if self._progress is not None and self._task_id is not None:
+                self._progress.update(self._task_id, completed=self._completed)
+        elif not self._isatty:
+            self._emit_pct()
+
+    def _finish(self, errored: bool = False) -> None:
+        if not errored:
+            if self._interactive:
+                if self._progress is not None and self._task_id is not None:
+                    completed = self._total if self._total > 0 else self._completed
+                    self._progress.update(
+                        self._task_id, completed=completed, refresh=True
+                    )
+                    self._progress.refresh()
+            elif not self._isatty:
+                with self._lock:
+                    if self._total > 0 and self._last_emitted < 100:
+                        self._elapsed_time()
+                        print(
+                            f"100% [Finished in: {self._elapsed}]",
+                            file=self._stream,
+                            flush=True,
+                        )
+        else:
+            print("", file=self._stream, flush=True)
+
+        if self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+
+    def __iter__(self) -> Iterator:
+        if self.iterable is None:
+            raise ValueError("No iterable provided to wrap.")
+        self._start()
+        errored = False
+        try:
+            for item in self.iterable:
+                yield item
+                self.update()
+        except BaseException:
+            errored = True
+            raise
+        finally:
+            self._finish(errored=errored)
+
+    def __enter__(self):
+        self._start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._finish(errored=exc_type is not None)
+        return False

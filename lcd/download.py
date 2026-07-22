@@ -16,8 +16,6 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from functools import partial
-from multiprocessing import Pool
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -25,11 +23,12 @@ import numpy as np
 import pandas as pd
 import requests
 import xarray as xr
+from dask import compute, delayed
+from dask.diagnostics import ProgressBar
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from . import classify as _classify
-from .progress import SerialProgressBar
 from .schema import (
     BASE_COLUMNS,
     BASE_URL,
@@ -186,6 +185,7 @@ def download_stations(
     out_dir: Union[str, Path],
     base_url: str = BASE_URL,
     workers: int = 16,
+    scheduler: str = "processes",
     timeout: float = 60.0,
 ) -> dict[str, int]:
     """Download every valid (station, year) CSV concurrently.
@@ -203,7 +203,6 @@ def download_stations(
             if begin <= year <= end:
                 jobs.append((year, sid))
 
-    logger.info("Downloading %d station-year files", len(jobs))
     session = _make_session()
     worker = partial(
         _download_job,
@@ -212,15 +211,21 @@ def download_stations(
         out_dir=out_dir,
         timeout=timeout,
     )
-    tally = {"ok": 0, "missing": 0, "error": 0}
-    with ThreadPool(processes=max(1, workers)) as pool:
-        results = pool.imap_unordered(worker, jobs)
-        for status in SerialProgressBar(
-            results, total=len(jobs), description="Downloading LCD"
-        ):
-            tally[status] += 1
 
-    logger.info("Download tally: %s", tally)
+    tasks = [delayed(worker)(job) for job in jobs]
+
+    tally = {"ok": 0, "missing": 0, "error": 0}
+
+    with ProgressBar():
+        statuses = compute(
+            *tasks,
+            scheduler=scheduler,
+            num_workers=max(1, workers),
+        )
+
+    for status in statuses:
+        tally[status] += 1
+
     return tally
 
 
@@ -298,7 +303,9 @@ def lst_to_utc(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"):
     """
     lon = df[lon_col].astype(float)
     offset = (((lon + 180.0) % 360.0 - 180.0) * (24.0 / 360.0)).round()
+    df["local_standard_time"] = df[time_col]
     df[time_col] = df[time_col] - pd.to_timedelta(offset, unit="h")
+
     return df
 
 
@@ -395,6 +402,7 @@ def clean_directory(
     workers: int = 8,
     classify: bool = True,
     months: Optional[Sequence[int]] = None,
+    scheduler: str = "processes",
 ) -> pd.DataFrame:
     """Clean every CSV under ``raw_dir`` in parallel, dedup, and classify.
 
@@ -407,21 +415,17 @@ def clean_directory(
     if not files:
         raise EmptyDataFrameError(f"No CSV files found under {raw_dir}")
 
-    logger.info("Cleaning %d station files", len(files))
-    worker = partial(read_and_clean, report_types=report_types, months=months)
-    try:
-        with Pool(processes=max(1, workers)) as pool:
-            results = pool.imap_unordered(worker, files)
-            frames = list(
-                SerialProgressBar(results, total=len(files), description="Cleaning LCD")
-            )
-    except Exception:
-        logger.warning("process pool unavailable; using threads")
-        with ThreadPool(processes=max(1, workers)) as pool:
-            results = pool.imap_unordered(worker, files)
-            frames = list(
-                SerialProgressBar(results, total=len(files), description="Cleaning LCD")
-            )
+    tasks = [
+        delayed(read_and_clean)(
+            file,
+            report_types=report_types,
+            months=months,
+        )
+        for file in files
+    ]
+
+    with ProgressBar():
+        frames = list(compute(*tasks, scheduler=scheduler, num_workers=max(1, workers)))
 
     df = pd.concat(frames, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
@@ -484,6 +488,7 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
     meta = df.groupby("station_id")[list(COORD_COLUMNS)].first().reindex(stations)
 
     ds = xr.Dataset(coords={"station": stations, "time": times})
+
     for c in COORD_COLUMNS:
         values = meta[c].values
         if c in STRING_COLUMNS:
@@ -507,6 +512,8 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
         if _is_datetime_dtype(ds[name].dtype):
             attrs.pop("units", None)  # CF datetime encoding owns 'units'
         ds[name].attrs.update(attrs)
+
+    ds["station"] = ds["station"].astype(np.int64)
     ds.attrs.update(
         title="NOAA Local Climatological Data (hourly, cleaned, SI units, UTC)",
         source=BASE_URL,
@@ -516,15 +523,13 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
     return ds
 
 
-def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> Path:
+def to_netcdf(df: pd.DataFrame, engine: str) -> Path:
     """Write a cleaned frame to compressed (station, time) netCDF.
 
     The 2D present-weather fields are stored compactly to avoid VLEN string
     overhead: ``prec_type`` becomes a CF int8 flag variable, and au/aw/mw
     become int16 categorical codes with a JSON 'categories' attribute.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     ds = to_xarray(df)
     encoding: dict[str, dict] = {}
 
@@ -560,7 +565,8 @@ def to_netcdf(df: pd.DataFrame, path: Union[str, Path]) -> Path:
         if _is_float_dtype(var.dtype):
             encoding[name] = {"zlib": True, "complevel": 4, "dtype": "float32"}
 
-    ds.to_netcdf(path, engine="netcdf4", encoding=encoding)
+    if engine == "pandas":
+        return ds.to_dataframe().reset_index()
     return ds
 
 
@@ -604,11 +610,11 @@ def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
 
 def build(
     region: Region,
-    output: Optional[Union[str, Path]] = None,
     stations_file: Union[str, Path] = STATIONS_FILE,
     base_url: str = BASE_URL,
     raw_dir: Optional[Union[str, Path]] = None,
     workers: int = 8,
+    scheduler: str = "processes",
     classify: bool = True,
     months: Optional[Sequence[int]] = None,
     keep_raw: bool = False,
@@ -617,7 +623,6 @@ def build(
     inv = select_stations(region, stations_file)
     if inv.empty:
         raise EmptyDataFrameError("No stations match the requested region.")
-    logger.info("Selected %d stations", len(inv))
 
     made_tmp = raw_dir is None
     raw_dir = (
@@ -631,13 +636,17 @@ def build(
             raw_dir,
             base_url=base_url,
             workers=max(workers, 16),
+            scheduler=scheduler,
         )
-        df = clean_directory(raw_dir, workers=workers, classify=classify, months=months)
+        df = clean_directory(
+            raw_dir,
+            workers=workers,
+            scheduler=scheduler,
+            classify=classify,
+            months=months,
+        )
     finally:
         if made_tmp and not keep_raw:
             shutil.rmtree(raw_dir, ignore_errors=True)
 
-    if output is not None:
-        to_netcdf(df, output)
-        logger.info("Wrote %d records to %s", len(df), output)
     return df

@@ -28,6 +28,7 @@ BASE_URL = "https://www.ncei.noaa.gov/data/local-climatological-data/access"
 
 # ----------------------------------------------------- Raw -> internal names
 
+
 # Station identity and hourly fields only; daily, monthly, normals, and
 # short-duration columns are discarded on read.
 RAW_TO_SHORT: dict[str, str] = {
@@ -82,7 +83,9 @@ BASE_COLUMNS: tuple[str, ...] = (
 )
 OUTPUT_COLUMNS: tuple[str, ...] = BASE_COLUMNS + ("prec_type",)
 
-STRING_COLUMNS: tuple[str, ...] = ("city", "state") + WEATHER_COLUMNS + ("prec_type",)
+STRING_COLUMNS: tuple[str, ...] = (
+    ("city", "state", "station_id") + WEATHER_COLUMNS + ("prec_type",)
+)
 
 # Columns eligible for within-day lagging (CAPE originates from ERA5 and is
 # only present after an external merge).

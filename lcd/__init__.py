@@ -1,39 +1,56 @@
 """
-lcd: download, clean, and load NOAA Local Climatological Data.
+lcd: download, clean, and load NOAA Local Climatological Data (LCDv2).
+
+All user-facing routines return :class:`xarray.Dataset` objects with dimensions
+(station, time).
 
 Quick start
 -----------
-Download a region and write a compressed netCDF (timestamps are UTC)::
+Retrieve hourly records for a region (timestamps are UTC)::
 
     import lcd
 
-    path = lcd.get_lcd_from_noaa(
+    ds = lcd.get_lcd_from_noaa(
         lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
         min_year=1980, max_year=2024,
+        freq="hourly",               # or "daily"
         months=[6, 7, 8],            # optional calendar-month filter
         classify_convective=True,
-        as_netcdf=True,              # returns the .nc path; False returns a DataFrame
     )
 
-Load a stored file::
+Retrieve daily summaries instead (timestamps are Local Standard dates)::
 
-    df = lcd.open_dataset(path, engine="pandas")     # long DataFrame
-    ds = lcd.open_dataset(path, engine="netcdf")     # xarray Dataset (station, time)
+    ds = lcd.get_lcd_from_noaa(
+        lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
+        min_year=1980, max_year=2024,
+        freq="daily",
+    )
 
-Derive and save event durations or lagged predictors::
+Write and reload a stored file::
 
-    lcd.get_durations(df, output="durations.nc")
-    lcd.get_lag(df, lag=1, output="lag1.nc")
+    lcd.save_dataset(ds, "lcd.nc")
+    ds = lcd.open_dataset("lcd.nc")
 
-Classify precipitation regimes yourself from the retained au/aw/mw groups::
+Derive event durations or lagged predictors::
+
+    durations = lcd.get_durations(ds, output="durations.nc")
+    lagged = lcd.get_lag(ds, lag=1, output="lag1.nc")
+
+Classify precipitation regimes from the retained au/aw/mw groups::
 
     from lcd.classify import add_precip_type
     df = add_precip_type(df)
 """
 
-from . import classify
+from . import classify, schema
 from .cities import add_city_names
-from .core import get_durations, get_lag, get_lcd_from_noaa, open_dataset
+from .core import (
+    get_durations,
+    get_lag,
+    get_lcd_from_noaa,
+    open_dataset,
+    save_dataset,
+)
 from .download import (
     DataNotFoundError,
     EmptyDataFrameError,
@@ -50,14 +67,19 @@ from .download import (
     to_netcdf,
     to_xarray,
 )
+from .schema import FREQS, EXAMPLE_DIR, get_freq_spec
+
+__version__ = "0.3.0"
 
 __all__ = [
     "get_lcd_from_noaa",
     "open_dataset",
+    "save_dataset",
     "get_durations",
     "get_lag",
     "add_city_names",
     "classify",
+    "schema",
     "Region",
     "build",
     "select_stations",
@@ -70,6 +92,10 @@ __all__ = [
     "to_netcdf",
     "read_netcdf",
     "open_xarray",
+    "FREQS",
+    "EXAMPLE_DIR",
+    "get_freq_spec",
     "DataNotFoundError",
     "EmptyDataFrameError",
+    "__version__",
 ]

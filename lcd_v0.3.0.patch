@@ -1,0 +1,2647 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..8743ff9
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,6 @@
++__pycache__/
++*.py[cod]
++*.egg-info/
++build/
++dist/
++.ipynb_checkpoints/
+diff --git a/README.md b/README.md
+index 2f2191b..242ad85 100644
+--- a/README.md
++++ b/README.md
+@@ -1,11 +1,14 @@
+ # local_climatological_data
+ 
+-Download, clean, and load NOAA Local Climatological Data (LCD) hourly station
++Download, clean, and load NOAA Local Climatological Data (LCDv2) station
+ records. Stations are selected from the packaged NCEI inventory by bounding box
+-and year range, downloaded as per-station annual CSV files, converted to SI
+-units, converted from Local Standard Time to UTC, deduplicated on
+-station-time, optionally classified into convective and stratiform regimes,
+-and stored as compressed netCDF.
++and year range, downloaded as per-station annual CSV files, filtered to a single
++requested temporal frequency (hourly or daily), converted to SI units,
++deduplicated on station-time, optionally classified into convective and
++stratiform regimes, and returned as an `xarray.Dataset`.
++
++All user-facing functions return `xarray.Dataset` objects. DataFrame return
++options have been removed; use `Dataset.to_dataframe()` if a frame is required.
+ 
+ ## Installation
+ 
+@@ -14,9 +17,33 @@ pip install -e .
+ pip install -e ".[cities]"   # optional: cartopy-based city assignment
+ ```
+ 
+-Core requirements: numpy, pandas, xarray, netCDF4, requests. The station
++Core requirements: numpy, pandas, xarray, netCDF4, dask, requests. The station
+ inventory ships in `lcd/data/airports.stations`.
+ 
++## Example download
++
++A representative NCEI station-year file and the dataset documentation ship with
++the package under `lcd/data/example_download`:
++
++```
++lcd/data/example_download/
++    01001099999.csv         # NCEI LCDv2 station-year file (JAN MAYEN, 2025)
++    LCD_documentation.pdf   # NCEI LCD Dataset Documentation
++```
++
++The CSV shows the full set of columns NCEI distributes. Hourly fields are
++prefixed `Hourly*`, daily-summary fields `Daily*`, and monthly fields
++`Monthly*`; this package reads the hourly or daily subset listed under
++[Schema](#schema). The file is reachable at `lcd.EXAMPLE_DIR` and can be cleaned
++directly without any network access:
++
++```python
++import lcd
++
++df = lcd.read_and_clean(lcd.EXAMPLE_DIR / "01001099999.csv", freq="hourly")
++ds = lcd.to_xarray(df)
++```
++
+ ## User-facing functions
+ 
+ ### get_lcd_from_noaa
+@@ -27,38 +54,57 @@ import lcd
+ ds = lcd.get_lcd_from_noaa(
+     lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
+     min_year=1980, max_year=2024,
+-    months=[6, 7, 8],           # optional calendar-month filter (UTC)
+-    classify_convective=True,   # adds a 'prec_type' column
+-
++    freq="hourly",              # "hourly" or "daily"
++    months=[6, 7, 8],           # optional calendar-month filter
++    classify_convective=True,   # adds a 'prec_type' variable (hourly only)
++    output="lcd.nc",            # optional: also write compressed netCDF
+ )
+ ```
+ 
++Returns an `xarray.Dataset` with dimensions `(station, time)`.
++
++### Selecting the temporal frequency
++
++`freq` selects which records are retained; rows belonging to the other
++frequency, and all monthly and normals rows, are discarded.
++
++| freq | Report types retained | Time convention | Variables |
++| --- | --- | --- | --- |
++| `"hourly"` | FM-12, FM-15, FM-16 | UTC, ceiled to the hour | hourly set |
++| `"daily"` | SOD | Local Standard calendar date | daily-summary set |
+ 
++```python
++ds_hourly = lcd.get_lcd_from_noaa(..., freq="hourly")
++ds_daily  = lcd.get_lcd_from_noaa(..., freq="daily")
++```
++
++Daily summaries carry no sub-hourly present-weather groups, so
++`classify_convective` is ignored when `freq="daily"`.
+ 
+-### open_dataset
++### open_dataset and save_dataset
+ 
+ ```python
+-df = lcd.open_dataset(path, engine="pandas")     # long DataFrame, padding removed
+-ds = lcd.open_dataset(path, engine="netcdf")     # xarray Dataset (station, time)
++ds = lcd.open_dataset("lcd.nc")        # xarray Dataset (station, time)
++lcd.save_dataset(ds, "copy.nc")        # compressed netCDF, returns the path
+ ```
+ 
+ ### get_durations and get_lag
+ 
+-Both accept a DataFrame or a stored file path and can be saved directly by
+-passing ``output``.
++Both accept a Dataset or a stored file path, return a Dataset, and can be
++written directly by passing `output`.
+ 
+ ```python
+-durations = lcd.get_durations(df)                       # 'duration' column, minutes
+-lcd.get_durations(df, output="durations.nc")            # writes netCDF, returns path
+-lcd.get_lag(df, lag=1, output="lag1.nc")                # within-day lag, returns path
++durations = lcd.get_durations(ds)                     # 'duration' variable, minutes
++lcd.get_durations(ds, output="durations.nc")
++lcd.get_lag(ds, lag=1, output="lag1.nc")              # within-day lag
+ ```
+ 
+ ## Classification
+ 
+-Records retain the raw present-weather groups `au`, `aw`, and `mw`, so users
+-may define their own schemes. The default convective classification is applied
++Records retain the raw present-weather groups `au`, `aw`, and `mw`, so users may
++define their own schemes. The default convective classification is applied
+ during retrieval (`classify_convective=True`) and can also be applied
+-separately.
++separately to any frame carrying those columns.
+ 
+ ```python
+ from lcd.classify import add_precip_type, convective_mask, precip_type
+@@ -78,64 +124,128 @@ returned unchanged. Enable it during retrieval with
+ 
+ ## Schema
+ 
++### Shared
++
+ | Short | Long name | Units |
+ | --- | --- | --- |
+-| time | Observation Time (UTC) | UTC |
++| time | Observation Time | UTC (hourly), LST date (daily) |
+ | station_id | NOAA Station Identifier | |
+ | lat | Station Latitude | degrees_north |
+ | lon | Station Longitude | degrees_east |
+ | elev | Station Elevation | m |
+ | city | Station City | |
+ | state | Station State | |
+-| t | Air Temperature | degC |
+-| dpt | Dew Point Temperature | degC |
+-| rh | Relative Humidity | % |
+-| wd | Wind Direction | degrees |
+-| ws | Wind Speed | m/s |
+-| wsg | Wind Gust Speed | m/s |
+-| sp | Sea Level Pressure | hPa |
+-| stp | Station Pressure | hPa |
+-| vis | Horizontal Visibility | km |
+-| prec | Hourly Precipitation Intensity | mm/hr |
+-| au | Automated Present Weather (AU group) | |
+-| aw | Automated Present Weather (AW group) | |
+-| mw | Manual Present Weather (MW group) | |
+-| prec_type | Precipitation regime | convective, stratiform, none |
+-
+-Unit conversions follow the NCEI LCD Dataset Documentation: temperature from
+-degrees Fahrenheit, wind speed from miles per hour, precipitation from inches
+-(trace = 0.005 in), station and sea level pressure from inches of mercury, and
+-visibility from miles. Only hourly report types (FM-12, FM-15, FM-16) are
+-retained; daily and monthly summary rows are discarded. Observation times are
+-ceiled to the hour, and among duplicate hours the record reporting
+-precipitation with the fewest missing fields is kept.
++
++### Hourly (`freq="hourly"`)
++
++| Short | Long name | Units | Source column |
++| --- | --- | --- | --- |
++| t | Air Temperature | degC | HourlyDryBulbTemperature |
++| dpt | Dew Point Temperature | degC | HourlyDewPointTemperature |
++| wbt | Wet Bulb Temperature | degC | HourlyWetBulbTemperature |
++| rh | Relative Humidity | % | HourlyRelativeHumidity |
++| wd | Wind Direction | degrees | HourlyWindDirection |
++| ws | Wind Speed | m/s | HourlyWindSpeed |
++| wsg | Wind Gust Speed | m/s | HourlyWindGustSpeed |
++| sp | Sea Level Pressure | hPa | HourlySeaLevelPressure |
++| stp | Station Pressure | hPa | HourlyStationPressure |
++| alt | Altimeter Setting | hPa | HourlyAltimeterSetting |
++| pchg | 3-Hour Net Pressure Change | hPa | HourlyPressureChange |
++| ptend | Pressure Tendency Code (0-8) | | HourlyPressureTendency |
++| vis | Horizontal Visibility | km | HourlyVisibility |
++| prec | Precipitation | mm/hr | HourlyPrecipitation |
++| skyc | Sky Condition / Cloud Layers | | HourlySkyConditions |
++| au | Automated Present Weather (AU group) | | HourlyPresentWeatherType |
++| aw | Automated Present Weather (AW group) | | HourlyPresentWeatherType |
++| mw | Manual Present Weather (MW group) | | HourlyPresentWeatherType |
++| prec_type | Precipitation regime | convective, stratiform, none | derived |
++
++`wbt`, `alt`, `pchg`, `ptend`, and `skyc` are standard atmospheric-analysis
++fields added in version 0.3.0. Wet-bulb temperature supports moist
++thermodynamic diagnostics; the altimeter setting and the 3-hour pressure change
++and tendency code support synoptic pressure-trend analysis; sky condition
++carries cloud coverage in oktas and layer base heights.
++
++`skyc` follows the documented `ccc:ll-xxx` layer format, where `ccc` is the
++coverage contraction (CLR, FEW, SCT, BKN, OVC, VV), `ll` is the layer amount in
++oktas (00-08, with 09 an obscuration and 10 a partial obscuration), and `xxx` is
++the cloud base height in hundreds of feet. Up to three layers are reported.
++
++`ptend` is the WMO pressure-tendency characteristic: codes 0-3 indicate a net
++pressure increase over the previous three hours, 4 no change, and 5-8 a net
++decrease.
++
++### Daily (`freq="daily"`)
++
++| Short | Long name | Units | Source column |
++| --- | --- | --- | --- |
++| tmax | Daily Maximum Air Temperature | degC | DailyMaximumDryBulbTemperature |
++| tmin | Daily Minimum Air Temperature | degC | DailyMinimumDryBulbTemperature |
++| tavg | Daily Average Air Temperature | degC | DailyAverageDryBulbTemperature |
++| dpt | Dew Point Temperature | degC | DailyAverageDewPointTemperature |
++| wbt | Wet Bulb Temperature | degC | DailyAverageWetBulbTemperature |
++| rh | Relative Humidity | % | DailyAverageRelativeHumidity |
++| stp | Station Pressure | hPa | DailyAverageStationPressure |
++| sp | Sea Level Pressure | hPa | DailyAverageSeaLevelPressure |
++| ws | Wind Speed | m/s | DailyAverageWindSpeed |
++| wsg | Wind Gust Speed | m/s | DailyPeakWindSpeed |
++| wd | Wind Direction | degrees | DailyPeakWindDirection |
++| ws_sust | Daily Maximum Sustained Wind Speed | m/s | DailySustainedWindSpeed |
++| wd_sust | Daily Maximum Sustained Wind Direction | degrees | DailySustainedWindDirection |
++| prec | Precipitation | mm | DailyPrecipitation |
++| snow | Daily Snowfall | mm | DailySnowfall |
++| snwd | Daily Snow Depth | mm | DailySnowDepth |
++| hdd | Heating Degree Days (base 65 degF) | degF-day | DailyHeatingDegreeDays |
++| cdd | Cooling Degree Days (base 65 degF) | degF-day | DailyCoolingDegreeDays |
++| wt | Daily Weather Type (GHCN-Daily WT codes) | | DailyWeather |
++
++Degree days are left on their reported 65 degF base, since the value is
++base-specific and not meaningfully expressed in SI.
++
++## Unit conversions
++
++Conversions follow the NCEI LCD Dataset Documentation
++(`lcd/data/example_download/LCD_documentation.pdf`): temperature from degrees
++Fahrenheit, wind speed from miles per hour, precipitation, snowfall, and snow
++depth from inches (trace = 0.005 in), station, sea level, and altimeter
++pressures and the 3-hour pressure change from inches of mercury, and visibility
++from miles.
++
++For the hourly frequency, observation times are ceiled to the hour, and among
++duplicate hours the record reporting precipitation with the fewest missing
++fields is kept.
+ 
+ ## Time zone handling
+ 
+-LCD timestamps are Local Standard Time and do not use daylight saving. The
+-standard offset is derived from longitude,
++LCD timestamps are Local Standard Time and do not use daylight saving. For
++hourly records the standard offset is derived from longitude,
+ 
+ ```
+ offset = round( ((lon + 180) mod 360 - 180) * 24 / 360 )   [hours]
+ UTC = LST - offset
+ ```
+ 
+-and applied per station.
++and applied per station. Daily summaries describe a Local Standard calendar day
++and are therefore normalised to that date without a UTC shift.
+ 
+ ## netCDF structure
+ 
+ Files are written as a CF `timeSeries` dataset with dimensions
+-`(station, time)`. Latitude, longitude, elevation, city, and state are
++`(station, time)`. The station coordinate holds the NOAA identifier as a string,
++preserving leading zeros. Latitude, longitude, elevation, city, and state are
+ coordinates along the station dimension; measurement variables are stored as
+-float32 with zlib compression. The present-weather fields are stored compactly:
+-`prec_type` as a CF int8 flag variable and au/aw/mw as int16 categorical codes
+-with a JSON category table, all decoded back to strings on read. Station
+-identifiers and observation times are unique along their dimensions.
++float32 with zlib compression. String fields are stored compactly: `prec_type`
++as a CF int8 flag variable and the remaining categorical fields (au, aw, mw,
++skyc, wt) as int16 codes with a JSON category table, all decoded back to strings
++on read. Station identifiers and observation times are unique along their
++dimensions.
+ 
+ ## References
+ 
+ - NOAA NCEI, Local Climatological Data (LCD): https://www.ncei.noaa.gov/products/land-based-station/local-climatological-data
++- NOAA NCEI, Local Climatological Data Dataset Documentation: https://www.ncei.noaa.gov/pub/data/cdo/documentation/LCD_documentation.pdf
++- NOAA NCEI, Local Climatological Data Version 2 (LCDv2) Dataset Documentation: https://www.ncei.noaa.gov/oa/local-climatological-data/v2/doc/lcdv2_DOCUMENTATION.pdf
+ - Kantor, D., Casey, N. W., Menne, M. J., Buddenberg, A. (2023). Local Climatological Data (LCD), Version 2. NOAA NCEI. https://doi.org/10.25921/jp3d-3v19
+-- Eagleson, P. S. (1972). Dynamics of flood frequency. Water Resources Research, 8(4), 878-898.
+-- Restrepo-Posada, P. J., Eagleson, P. S. (1982). Identification of independent rainstorms. Journal of Hydrology, 55(1-4), 303-319.
++- Eagleson, P. S. (1972). Dynamics of flood frequency. Water Resources Research, 8(4), 878-898. https://doi.org/10.1029/WR008i004p00878
++- Restrepo-Posada, P. J., Eagleson, P. S. (1982). Identification of independent rainstorms. Journal of Hydrology, 55(1-4), 303-319. https://doi.org/10.1016/0022-1694(82)90136-6
+ - Natural Earth populated places: https://www.naturalearthdata.com
+diff --git a/lcd/__init__.py b/lcd/__init__.py
+index 9de789b..23e8d63 100644
+--- a/lcd/__init__.py
++++ b/lcd/__init__.py
+@@ -1,39 +1,56 @@
+ """
+-lcd: download, clean, and load NOAA Local Climatological Data.
++lcd: download, clean, and load NOAA Local Climatological Data (LCDv2).
++
++All user-facing routines return :class:`xarray.Dataset` objects with dimensions
++(station, time).
+ 
+ Quick start
+ -----------
+-Download a region and write a compressed netCDF (timestamps are UTC)::
++Retrieve hourly records for a region (timestamps are UTC)::
+ 
+     import lcd
+ 
+-    path = lcd.get_lcd_from_noaa(
++    ds = lcd.get_lcd_from_noaa(
+         lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
+         min_year=1980, max_year=2024,
++        freq="hourly",               # or "daily"
+         months=[6, 7, 8],            # optional calendar-month filter
+         classify_convective=True,
+-        as_netcdf=True,              # returns the .nc path; False returns a DataFrame
+     )
+ 
+-Load a stored file::
++Retrieve daily summaries instead (timestamps are Local Standard dates)::
++
++    ds = lcd.get_lcd_from_noaa(
++        lon_min=-73, lon_max=-66, lat_min=40, lat_max=50,
++        min_year=1980, max_year=2024,
++        freq="daily",
++    )
++
++Write and reload a stored file::
+ 
+-    df = lcd.open_dataset(path, engine="pandas")     # long DataFrame
+-    ds = lcd.open_dataset(path, engine="netcdf")     # xarray Dataset (station, time)
++    lcd.save_dataset(ds, "lcd.nc")
++    ds = lcd.open_dataset("lcd.nc")
+ 
+-Derive and save event durations or lagged predictors::
++Derive event durations or lagged predictors::
+ 
+-    lcd.get_durations(df, output="durations.nc")
+-    lcd.get_lag(df, lag=1, output="lag1.nc")
++    durations = lcd.get_durations(ds, output="durations.nc")
++    lagged = lcd.get_lag(ds, lag=1, output="lag1.nc")
+ 
+-Classify precipitation regimes yourself from the retained au/aw/mw groups::
++Classify precipitation regimes from the retained au/aw/mw groups::
+ 
+     from lcd.classify import add_precip_type
+     df = add_precip_type(df)
+ """
+ 
+-from . import classify
++from . import classify, schema
+ from .cities import add_city_names
+-from .core import get_durations, get_lag, get_lcd_from_noaa, open_dataset
++from .core import (
++    get_durations,
++    get_lag,
++    get_lcd_from_noaa,
++    open_dataset,
++    save_dataset,
++)
+ from .download import (
+     DataNotFoundError,
+     EmptyDataFrameError,
+@@ -50,14 +67,19 @@ from .download import (
+     to_netcdf,
+     to_xarray,
+ )
++from .schema import FREQS, EXAMPLE_DIR, get_freq_spec
++
++__version__ = "0.3.0"
+ 
+ __all__ = [
+     "get_lcd_from_noaa",
+     "open_dataset",
++    "save_dataset",
+     "get_durations",
+     "get_lag",
+     "add_city_names",
+     "classify",
++    "schema",
+     "Region",
+     "build",
+     "select_stations",
+@@ -70,6 +92,10 @@ __all__ = [
+     "to_netcdf",
+     "read_netcdf",
+     "open_xarray",
++    "FREQS",
++    "EXAMPLE_DIR",
++    "get_freq_spec",
+     "DataNotFoundError",
+     "EmptyDataFrameError",
++    "__version__",
+ ]
+diff --git a/lcd/__pycache__/__init__.cpython-314.pyc b/lcd/__pycache__/__init__.cpython-314.pyc
+deleted file mode 100644
+index 8bd48ab1bc788343fdde46c0151e2db8f4239352..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 1859
+zcmah}-EJF26y9|l+gZnUoS&v3p^TiHSU7P~LR$hx3Q422RHY&+R|tk-ckFDtyR(`(
+zo5Xjh55RlyJlu_hK;i{}3iXyVv$m6#i;m>ab7p7G`Q|%k&d1G$=ivDHj~`x;s^k1=
+zjM*qnC$C@O<R|CC0q1-7!X3JP2})aLUK%d=WhmSE!f?^AK*g^@)vrO#UxFpOULJaW
+z9qRrvEc*>;_)Tc~Eok{Gu;RC&?XSYBzXogmI;{H}u;Jf>d;TVD`uE}fmb2$vRGzu;
+z!NuaX)2%YS;5c3!ghwP4*J&(R*dsyAS=u8k4T)JG=g*Fh$x{)qn4H8>!a&4g92xVJ
+z0o(Juuk$E)Nfa;%-tO)2PNyyjBa)9Jky@YEG6IfEfk-mRmEs{uIh>rHksXK<j&71n
+z5hgkL=J`qY=*aU3jws251cFoxJ7aK32FBhSbD;Q7M^Yp-6^!lJ6XsMbQkq2RVE54{
+zy~1EOgWZP@(O_V|9PUr&_~Fz2-uxt<q7%;K;NY{zxFumXh52Cr!Qq`<B85ve_!b>L
+z>XFCa^-R#&*d`(ayfq4iV(~O&ayKyt$S8_|%XzFIW=ch)2@OPg#RG`0_~5zB`E4Ag
+zC~6dhqhfs)q4?iMbs?9jB5=vcUK$W1&gbNe#fs0rF`KP3$r5e@cRlZ^$u7gh35iKS
+zQhcU%IGSoJGM>^9)2uk`7`Hvb({YsYK_|lkVXD)$B({yZ<99-Y>iu4dYt6mfFe%x@
+z`oV}~2dlwI*dwMikn$;)sE(~8#c;x}cnT!UrQN28keJ!=7_Wo16-EJGP0cPftCjig
+zop976B8M!8L1(^-0(QDqqS*oTXt(13;NbQIng_*Z?_`=m6E%pks9<fY9xIwmL@pJN
+zN5qt<%@Ssep^7Mf-e=eS<eH47$g??DyV1m-)yC`rurQ=W5DJs5NTtozJ0Fm6*Xz2v
+zHgkaUrr8rjFrg_{f$ElZ!@QmO&2`m2B{tUW|Gg=_e76+3P2Dz+|6IVC$kXtNltSvY
+zCrJhqvu?|*Sgc&wr>_@(%%eEeE!$ma7@<&@oQZDF8V{Z3T4^s<Kta$P0$sOZi?Yy7
+z$yrFT?x^*m>((wxNVia7^m*&1fi7axwx}r{y@cj;tC<!q&%5igg3VZBt9E4Bz@mW#
+z1EyU|)6Hewz^Z|Ufn@_L2AT%e3~U%!H_$fFGEg(HgwXv^S1AoeK&dYL>Ix<z;>t$S
+z<p7`Ho$zx?x;B&N*4Z6OmWZWfiP)f)m*rpyTXL3{VQ6TuIHvR$=QWy+KJMp=OVxkz
+zQiNQJK6Yg6dckGCP%e0@;oDBo$Fl5G8l@3Xx|dCK?TbW&dCb3*Tj<fnpE^YNYr%Eh
+qze`(g`QNWx$KCwR>HO{te|3g$N-eka#(4|=>1@<Xud4DRJoq29xFW0o
+
+diff --git a/lcd/__pycache__/cities.cpython-314.pyc b/lcd/__pycache__/cities.cpython-314.pyc
+deleted file mode 100644
+index 1a85436c80a95bbbe131898c43e83e8dd017cae1..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 4573
+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
+CdlLQt
+
+diff --git a/lcd/__pycache__/classify.cpython-314.pyc b/lcd/__pycache__/classify.cpython-314.pyc
+deleted file mode 100644
+index 38626ad097084ac8cc625c47084032b0f292f0d2..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 3859
+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
+
+diff --git a/lcd/__pycache__/core.cpython-314.pyc b/lcd/__pycache__/core.cpython-314.pyc
+deleted file mode 100644
+index f51b2830e4378a348d4f030e6def59b174a1e4fd..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 12500
+zcmbtaU2GiJb)Nm-o#k@*Pl}?*5lM+!n_Nn=VmbP;O;MsrMWX1Dv`TGB%hB#|Io5J#
+zb7xi*RTrVt0+o^&VjhC9K#RD2l7RwMpAz)RMS-G^q}M9hsfwsbgCb9*A{#>d)bHGx
+z*<DhU<TeBH?wvdL|DOAu@0@#It&fQUp2@Z84<76hgkRH(`!w1S&y!w{AS?>9U<y|S
+z*)!o8_nO`wihCz~<9^f6<GzW&c+d=vhs@A;*bI+H%m`2SPl#p|dHoZ0W{m&VoAIk2
+zIWW;M-e@)=k4FwpG>tc#&EqX*%Xq8VI^JfsjklZa;~i!P{~nsyG2Ur*j_)*gj(3?|
+zJwj5Dcc1f^yX0OuEJtJ!bwsap$#qvc<=EA*TrbDv2Dwpgk{gG^a&x;Nx3mlShP*fL
+zF}vkHxfLmGJjG-7$o+CV-aDLkN!}yxz<a0jzFXdjw=Q}!d*xk-ck_6k+=IBp<NdO~
+zPe|-lrZG|CMMGsnGfGA)<RrCVvIVKAYX#GgW^^V^o*NmF&gdB>FOBB4ImOiTdQPL)
+zlZvS%MKPzE>3k-eo?-f2x}YnHBuQC)zL3|I?4Xp%t4d)|QVLm#sb+~4@RQM5){qoK
+zDyZh@$uSA7P+en8nNvl*s20*$yc(*Bn)pLiNs45cI#aXKjFwlav?3KzEh3e|RMSm`
+zF=c_Lp$6W&Y>6qRrWXvSx*~>am^?`;qB~kqv)_i)8yLS-&A-o3ZYbCCYQi3+l5=XX
+zf95rFRx1o;(Oh21<<K?Mmen%orXf{}COlSDDHL?O4Fj+KDaD*k_^r?x%~Y9^x5DR&
+z)Io}!SHD+M3mMf4Tr41I64~pOY&M<I%!PCTGh`%!RwE60Qa8u+QXzYaF`ZdKS<NB8
+z6}VQ?@>wg&=h2=FE6P+Qo5pNsvNKl1)SYO;XN6CUoIjPmD4($!&WybC&d7-~r_!V6
+z&Rje@dESbhzc6xP;@sr<^w`9iQ&uR0#vmM)_u_f0eoiZ-7gU9%nNrB9R?L}CBTcJg
+zg|A`x(j}I+Li0Mit}?@l7@1i$Tgt1<iWHfiQ4K>iEYTU7rW#{b_`0eVQQ>?BQYp|s
+zJ^lFi;q}QhB8x&wxaxi5&jcZhv@YRY&#XuG$X?lpe?R^M_z%h<Y_bq-GdU{P$+61z
+z3Soma%Pn%N+=lP%a)-PF-#hWYQ|=mW!j{<eTQ8ciLV3NA#u%-@41~{g-j$n(C?@}4
+zN01VBr^51K)8JLP$!Eq2&glhn*0|N~F7Es8+P;sBSFTvinY>~c+RQ>aqZe+d8B@EV
+zTK;Rgp0|Q(A*U78uXj2U^8SD=>jQ(*fW3|bS6CBzdMj3`-7wh|)`B$Fis0)8E<f)h
+zbx<OCyTaONWIiOYcFNU(;8sty0e4ZT4Re-6#y}&TlyxVS4B8v`){dJjN%BV<^h2qb
+z<u82mekwp(gFp?yghA`qYaJgh0bPvY53cK3mFdGwH6S&a+2K4vN;<O%Quw|f2AB*3
+zBGhDY!KzEAovov$)9e7MOyJ*GL9i%16^b6u?#Db_k2P)h==BjI0g7w{h5F`=5RZl_
+z8sSk<h&OFSd9;qAF&?cKV*ML&9&HdhyEhtnv`L8V+i2#|Hlcp!Mmvvo2(29(J9xBH
+zXzAbB$)jCV*)AUK7U~-}dU#Y48iqG^^JuTo*t*fjqy0j>d1DWc?iGSPj|V9F1Y;61
+z5eo5y@gK!Mq&)EC$A~Nnm)#v9q`WC#N=SK9{!}0pNr|%OFy+TnY`lyT_LFK%MN@UD
+zSSpkXrW#W9vbU0}DHR`Za%JmiA6*VqN;MsF+9@_&4pmcA;X|}D@L-qtlwY88vT8C7
+zkogiF!PST&<y1Y#l;W(GfeIj~g6=r!=m|hOhvOlF6zR<9Ne=Q*K+q|?c1MwLJz|uu
+zk?5JTsx+$uV-`dm3G9ZA@tbrF<$=VN@+K(^6?m;OX?wk)6vWM{BPq$QreeGn3^ro|
+z<gYE%j^!Fbuz~(5c@^4-i8KUyx6#t>j_$yFexZ_2;^=@mm{LgZK@S+>P~{OF{27#Z
+zM7b#)kvI~Gq<Su?2J#p9Y^aJIN4}h9ma?kk_6P$n+MtqO7?iYvl!dCBQ}VouteRu0
+zia9~?B=oye*pTK?x1`VT=`AvCPL<|Vre!q+&0!u2Y7X;!Lrsbf5Tb{Kh+BGiUN6yH
+z+g&W^%zi=6|3?>j@ucX&?4aZ#Ean72%7-(iF?5?)1|Zd}PBLE%$<&cClgH#Fr4zb2
+z>r4?J5dUEC5!rZ+S`9}B(>$PsLCIY|-qxtI()J1(R6CGS(Li(5n_vJ?Y+x$}l~i+B
+zR$Gb>U`Cl<%FRj#4kn#G=dp@Jx-^iPVll6w9JmLi5CO8e6TR^kvZV~I#hea)224##
+z6EnP;Nxh&BIz5n-eBS9+Qrt$nU~Hsb1|bSF3hjyutfcZ<F3qZZbD$}=+-7bh)owCA
+z(@@=9O6(1We)5W@r-@Rf&4r>mJuTf(m_`JOm{~^8m*%kRZPkXZ{Bf_X)OrV{UR$a4
+z{z<iKZW6EcT*)k!OpKD|7aWc6^`taC?N))dZ1sex<Ry;qVH}yZo2crj>7!K2X%3~h
+z>SZ9i7`{E@SOtfp@`^AckbSp08zWr(H=PtA=$w#3YD`AMEJD}jwQEVzxmzU183pA?
+zN@K`NZ8{{@o|QqK#8;no+dR`uQ^hVaq|x&!EW10)3I>tP7&kBgqck(4-K^G!p%JOB
+z)(7dL7D>vA;2RhohJ=>+=$zd4EEqs#2|{XudL%&_7-z#8W&@NK6pe3~44466ke60U
+zrVd?C=0JXdBvP`av7qz*@`*vS&M+X7HYm~-BU<8atC~f>c)pj{JnH1kfHsi0^G;*!
+zISBJfav8h^>Qq4g(EfQ+3p(!uetA7v&EWFqwu~;>o308dHibo>_*Qp!#sOaZtX9zG
+zN^?@7G<OZE19)H~3Ry<;P-U~wCT>UON<bb1vti6E@E$UP5umd@SEf2w)Is(kaW_Ev
+zbC5QyE&u>V)F$?9&(5==<o0Y6E$6)?QF9ix(woY(RAx`hVxGV@-7HuaZopJzq0(Q-
+zzpbEM8t*Qc+XdHZ;H{qk6O>>=*f?j;ifuJQk8e`!BoDR_xdx(|O^S|%uyq06uopnN
+zxn%($s+khwqUo08@<B`DR!g8s%79y+c(DODrR1?568b>99h(}+$wk_<MVhu5CE3+t
+zRa}b&T?1CR{Fva%;m4css+xiK{G?)Bm#S4%`dEa%&*#-V$M_+)hZ6Yobt740524Y`
+zSUslXjc34`KzMqZj6*;H4S9N+rkt>MMpN^!vuO>p7+3A4;T_EAu*0<iGNWDB^!jG4
+z+WM|C-KgIH6N7$oR(J+-4fVmTJU;y*xFU@I3dIq(!ZPpCC^-vI84<uu>SlfxAUHj3
+zW7_d5<|iG_=Hl^-YjL37#u6<5X1<60tQL3$)rKl+0z3`ow(9g>ya3#uDHUL`VP5B8
+z|HGv~W)FEZNP4h=_|}K8lN56Ca^{Alw2G)A$^)XVC#4H6JX8>>mKG>{MqQ*a)I1S8
+zl%?uz$^dnb$s@sc$eX(tXz^?KaZ*fpx#h@B#YBi3i`+EiR-qMk)j!({uFow$ZYd`G
+zj2v%_j1orH2CGMqXlC6MmnhgxK`#Y;6u>(t*p-m2!N_o{HoT=--o$2GlY29~*%_l5
+z1^2p7zw<~E+mCds@fr6MJB)O0CFT%W6ux9$p}u839IyFnSPwU>H?*&}@A<MZQXgC#
+z`?5t4k)eLQt#7??2YqVnUyrv^ylE%$h{44ZPg{g=)5F-#<rC#t&u#C2MO&8S<+gHE
+zTJcNlAlk~1;p7@=LBwH-d7kw1UOd-r;fKp2IP8N_6=J)P)$)_FX0IY@PuVLJ8$xia
+z$F}HeE$%_7YK&iDN#sg+*f4%<^PA5RH=B9zbNWEbO15*W=g?yc*2T^ZAATRz4QvGP
+z3%fbE=Wz%zdr*$mhf;#z$3F%Yc=FGPY_dp&iq!}Y%@p!%eGWMZuHBi7Z?-#SPfDm0
+z4tm{sW<4qRb>8?cJUzCBTD3(hZS}zhmVGsOT<aNqaO>$4E|bXeNA{;YN4%R`Nd%PF
+zux4jAxflt69A-p__FOBC^QsE-BQ?wc#MQ@2Z6z)XBKz?Ofya^QXJi+A@|&__hdT52
+zTtKW+U@{wXHIC7JMJNga2L=P;hMG+rtx#^a5U+^{Da=HWt}Hy5Hq8bng&COG0+&hg
+zR>K&1V&T|?g%2b6h-3xrURgmKIB&rRb-e%^-(jOiq(qRBY{0*DQ!`A1(SorU1z2Rk
+z61j@z4o#rcw<(?PWRk(Xd+i-xSL-2WZ{Z6U>ntMJ>|H`#!;=3;M;1@6N8@*o-Z^^r
+z_z#aitnXRrJ$V1n{k<#Fx6AcMR>DWtL$RffFG4#W#ygh}mE+P%SlTA(q1dw0K5#Gi
+z*SA($50=H(R{XC$yVD64`A#3?U3lS6_dCwX$Z!BVUUYUm@%^v6x7*#ECX+b9TbNUd
+zX?Wkk9pN5Mlk3A^J!sNuH<US8kA+;COinmL^7dCN2r3V=>Fdslk8rC`@CrwkuXk+M
+zHgEQ&nDP(kfpLV7{Hf64i9e=bUEH_f!|$UV-5UY?0#myCHbN8&3$cNX2*pHleMJ$o
+zr<Ab8eMl@g&U9dFJ_l#~DgSmjBYWJP-ymEJTnv_cNulH&!_m+@q===eo~}zu%6rH`
+zs!8v6pk^XMw@?ff1I6HFf^YszIi5B5oql%<sSx>`4?Eac45z|V6_lyw#Gy~%T%|u#
+zB<EWm@>(BuR0eACsW#RD8|~-PpH{tYsc;`g(j%07#b7a@35lTcPbfO|O;0np4+vhA
+z5+{7(2zDhu?jY|2nZc%(E9oUeVkI!+8E*YcZ%X@*;wwZCzKx8E(+!yU)6?6CA_ymB
+z57iT&lr%V%PCCaf;4xw$4Gto`0`q8FNyV4f_rranz@VxjD}W})-silgpo&T+Q<^K0
+z9|`2gm3C?0DJ2J1kE8?NK78;f9Cz3^YEd7W(hVi6aF$e)<&A@hqzH!xQA&G<p!1l8
+z9K1j_O}1Scl;&FCFe@E}K$J^^zo1BHZ~Gk7>`@7BC6&!<Fol#F+$9SO2?Oqt(tzUy
+zp{m`oNzrl*z_gaV@TteD({gZnso2h0^(Nl^S*901^;v!bV#|l&BhU+puoX!wIC3Ee
+zq7}-)axY$6u;OW$<C(PEq+xlBSu03p6Us#mIOEcQ2v|aNE(A}i-Hc7=B5VYL$3`hQ
+zNx>-!UPoYg(v~M@1z^6IhULS&8MI4@m+{ju8=PaL(kd;pE6BkC;>U;pox26GdFjxP
+zdKOOr5n9`ScKRo$mp}ZXW$?>@FBbgImcctGZ;yQG6CxeUo|XOY{A+mp-&zJY0zyE1
+zEFi;|VIdm3oA_a3>C`>{7vj+3=(-rYJA7yO^UnQc@xYpRd{sRD*`XEjcv&3B$58BZ
+z0{D*Q=5l<`N_fwDw0`mQ@1HcHswd>{{-pgxFt~}d(O&lvY1_y9`$8z^r%c0ij2huE
+zZqM8a6r>f(v3|tt=^LXMF*x=P1utW1>&Rpfxh0m?NQjDnBPxC$Md~&J_{IDIM?(|~
+z6OKj@vvCytuRPxbM|~;ZOL5eHF|Y+kPu1Y)yRz3s!WtY67X8J*OK~)alRLj#x)@4@
+zo`a*om*A*R4peY7l=41<qpSu;Llqni6#c-_kWvpEy|n2x*Ri75oSt34sVfdGXy0Fl
+zV~qQ|DvnK<&f*yy{t`eDkUDN$*n<`RgiT#N9)Q)qkbt#}3b-?(01Sp}l<9^c(m^tJ
+z-ot6C8b_r$Ez1v=fws2S1SaOZ!m>l)q<IiD$9;ohNr~VL!2E~7Sq&ty2?!BviD~>?
+zV5bqXGZaiBNQ9Y8@$(2QF->D$NR!B4q|_7zmnZ;tcdW#)y*Z{Sp@JyvkLdM13f`yS
+zG6I8k;ATh(ah8nQGx)^!#)pUiOxh}7vcCV|FT}qWe|hYS{o`NMO|0%8|I~la^W*oH
+zJ!`Q(ye*zut($l#*8Snw5fx&mJ?ttvun9N(NZ`03@vc1|H-^2yi@+AVusK*=tzGw0
+zkoX@oWYDoJfrQVq3jpcawbF8MgMROS$X}~e75Vs6=_k$gW?psK;W8i;lxxf5?jF~A
+zvrpesI18*fBdoEx5}rxiZxA&&tYJlfuX5S2B6M!dkBT|zhkTK`;kK&H?rp&$>EZ+I
+zLu65S7;0SV|4Z-B>;9r{EwtzJ(4O^p^X=%vXxoxmj&`m1yQ%}lKIRY6H@+bKh`iv^
+z09oH&ZhZ&sMIlwkR0^gkpyD=kzYMj%LQZ2h0$PxWXWwHAmX2-E&nFrFb1%;m?cP?V
+z8%0PN@!qbW|5z5h+7BqKx8&sn7Dx8q>xF4uTh7Tvc2W-IyM*uH<Ui#F2=8#ntgncp
+zVt3JUAi-T^o>O~U9@jjFNi9r;wtU2^Tv^-~l`f*REDUy5%Wp@Yr^sU3@}Qh&FVfKZ
+zb~L#{qEo(2wO5F8wYpR#Z;?!dZEB;oYHM)~hAGU?*2kTfqW{v{DWB6r@<?rYWKR<A
+z3ReX=3dURXLcRFdIb^m%X<TnuNT<Q)aFvFR!VDOI4fw?7=(|6o7Z*5iTHdS)&IclG
+zLu|m9)n-gwMIqd0XOS5Y!Uc7j3VJeBHg8x#`xcTx%gb4r?f$ujS4IIB(O)34DEvqJ
+zKskDJwS8b|_kAy6=cjMo9l1S%gvFC9(WAeL#@FMGcjxcS|7c+)+_4^s-tE5Ay&Nn@
+zde$QStC9Y4WbfjM^_I4!8$Uh$v$H=ryVkOIwFOCw3m=_bkHzo4cjvw3NIBN~$)N|a
+zeQUAgYAkurD92t~99xey-@SV0>hg)@g}*vmj=i!L+rJvyUydEbr+Dk4`O)|~NZ#Q)
+zhnFXokKR69jt;E&2Y&y%MxpMQL2`4aX|&J(Nf5y%1pdD;H!{M#oVnR9H+wGmrXQub
+zBBR=7ze5yz+0OT1(;BoKwpVS$LvFPZ&w99p{Awc}ZUj@rv4VLNq^;?3grYVaVEa}c
+z+I}1kf(Qw`rd(L7WZASKYs)%0=uVU?jN5F=7XZK%LFbldig@If$K4pRZ?MMlEfSlo
+zd3OuJ(sssx9JpFpyZx>Tbf4>ao0Z(7?nw3t#lWQlJa_QYsZ?;V2B-#W=7{siZJ@#J
+z^L86O<-aPpS`Ix7y<n?{+_6jnZnr*e8^!RY9}L#avmCB{n*y9~edLH+Z!v;32ZV2Z
+zQW4x*^U$rf!+!f)QIPA9w+3+CGBk!Qvpf!|iM-~ekzMX`^G%Wee#`UR8aJ)m)b1_C
+z@am4<Z3i{=J)27o0W4$gs!r|MCWjw6>fIdROmPmP7dQ#c@%+-?z71bF&Zft3=}aVO
+zw9Q&8%-tGb-F7}<@@*^ZnxvLLug;jb_!y$!H111AnU<S%Y+%bbtIs>7u<`R~2XzPS
+z3r9HWsIXd~vo?dvNyuQuOx*0urww>baS;gD-_VnS!oEk}g78)tr8z5rvnA%Bx!=%k
+zsdSl+E^}G|+^)g>Ntp8)%UdW~zJgM){F;Fp2<WXKnf?U@nt}uVDAG7IVMwOy<<pGx
+zyo#HLn2a0gEN*Cq$@`mz*<eKq>U^5d2YCQ+f77t)+_|7@j2u#3zU`c;unW`(1svJV
+zVq+}|@YaDpSCzo4tC3glx2!~7Ek|C5CWtpK?fv-H-S6M|emO3!#rsy{eQWUptMLQn
+z_-prP9>k9=j<3ht>HA90>*e_2#qme6_)_rW_m+3xxeDZOX!}{+PwMUkmg>q4$(4AL
+zXJ3sE;kTjflkYz09D2}@T%35++P&7gXSH=txpiQzb!fG9=-$kIrQG@kG|#P%CSA=V
+zmScTuv3;wteNZr{y`}R(%c1+`gO;Of&7-T$qo18FH=kQP^9X9K<4(uY;63p(|G(_L
+z-BFIbi?JjRES~uDv5&@XAH4m+$8RpbyBh8OL|lo!vg&{J;b8Lb#y%aZe4qLF$lbT@
+zyag7z{J~0e->N_1DzDSa$4GhYTZ;~_Mu&eHynk~gI$Vyvz2bkH13r$^4%0M~|C+l=
+zxOtQCO<rKfkOXFYlzx2wjS$bqTkNO!nM`<pOE@=~*u(jRo=K-+fu(0kI9;V1lEe<J
+z5V@vs1;uf-<0=lUQ$~ov2#^>dJPT3I0PZz_bo`JKs6Csd2c2uf-kZ2qjH6{3qx{4V
+zGUwdav;Fp@j_vb6cr6__em!E?F*rG&Qy4+8&2WfWQIB!*jb3gua+~;bs=~#OlrEnr
+z+piQp216W|hu>s>gAX(X#y=w1@OeC*$KH^~|5cOV>HCe)@hjn5W#L=D7MlKDXvW`f
+zgx;t4?0qUw&>(o;TosQ0&L4<+7ekNR_zlc9p}V(ovvX%x<!0x=p~}t9)?JmGoh_}E
+zo1F)bS8jH8?5f=CY}@(NzS+sIr9RDr0vvk!I=tLZkHJOrRTAdeS9P!no_17}|NjEh
+Ck#S-G
+
+diff --git a/lcd/__pycache__/download.cpython-314.pyc b/lcd/__pycache__/download.cpython-314.pyc
+deleted file mode 100644
+index 391f25d4b46ce1e60b5c4fd8c098e1635a3ce510..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 37990
+zcmch=3wRXQohMrTe!tWbdZX3@2??pi8zI0T^guEo<d%@^Sh(G&TS7*UPIU{6#);+0
+z>{{3+2#>wAGtMGsoVD2TthwJ!_G9nO%;MO|cz3fqYFctDHRKDklY8^!oA1tuV3x#t
+z@9zEmPgQkwi#9m(<=YaRI$d?@oKvUH`M>}Fv&n8Vb2#?je)hR<^l{wZ(GU4BiW$}2
+zTN;iFa5LOyF3MGLJ}#<yhV!Yq)Sa5Bri?>g-KC9c*;yCWv9ms^XJ<pyfU~B{*lCKI
+zSXphCxziH0u)MCz+G&g0SYF>{?{q{RozAGU(-n0|_2xv~te)Ix9y_m#u4Cu?XaUZK
+zuENfuXi;Zzw3wAQc9nFNMoU@V)V02|ELz6$<}OcXd9)mPmCw>u(ODU-VtH%VhR*6}
+zb!SbqrgLL-V`pu&wzDo;*SRUWsk1&>-`Nmt==4UtosH4P&dt%yom-+?I=4o*c5aJq
+z>)amQ-nk>XqjP6;XBl@w*E1mxn{qDae75Z>@prW8L{ks1+>>)PQf8!$<4UNWsC-8`
+zmvh^tAJIK0_Vk=n?#MYjH!bItGupSy?aOEMwW;T8N*OtKVoyei7v<~98EwoczvP_q
+zR33-+9QmBjd7@=IW(*zCgY2pcS94CZrmnV~Frlp5m%B?E9abt2rPgg%i%+KBxc$VI
+zZ7N?r?iJ*7W6m*Ew8PiwE5z?2>GvUDF@BZMuV|;Q6#4Zm-*uwq8K<wz=h>$9mE&rK
+zRQ_>aC4N=0GKYN|kgsO>Bfc8sH?sUuUoG-=EZ^<hgnT{AAM<tj8t}_YztEQ+{BFeW
+z&C>5Dd|U8qD=X_eQR`E0Q~S2z%692~?}^%HjCgakuWXynw*z-}N_YBvk4KODcAe<=
+zHC1B>e7kY4nbkAk+k^aGmVeT>5BbMf{wd#n<PWg?S9~qVA7uHbeXYp1vHakPEhlPx
+zYP4C#T5aEE^mX9wA-aqHpYW+Gx!S{lKgEYIw+wxCYBVw$9i5!;1SW!>p|Mb4Vsv7}
+zGd#(Ax{tNAc#cdC1;#wBW257N=;YYs$SD163q%86v$;1KU{6LuW1%6I8|Ej+J<(Gk
+zPj_p3muGb1OlTrH$)BtD3{6f9P4PT_dOG|1dOX3&vlC;JfuQHiXuuON^Pwnzj@soz
+zU!4j?q7hFd6p5f$^`29cQ~cPuhRKPsb4vHljz&*;db>PR6Qfb8`%H*urOje@(XokO
+zfDd~5M#n>*=%nX(Uu$|XPcRgm3XkDkSg$9CJsTt9yVQH4c%;@74vg}Vdh=wM3gC@d
+z8+gYvA#@^ut_@2M*Ryd8pul*TN1sE%2kM##MO)iC%#jd38W<a$7TX-292=WFORr4B
+z)!M<@?M0DLL~Lw=TK1Z2Re~ijF)=B2FVc<QrXYr&^#VT(;Q${+y~t{N0?|{o8o_u>
+z>a}3(rQw_y3JJR76R56MEf}byQ_+xM2!_T2=R!ehpogCvq0S!+@br_uP)jfnj)v%`
+z&PN{y8Kd;(=W1Po^<YbHyTA3=k>f|Zdj%u=b=-GEu(cjL=4(scaCaWV)u;Tv_MT(D
+zK7Zd+J?*`MxvRUi)8BW@fApwe>FVx0METC17Qu0}y`}fKPpQ{@wChMa-93C%Fdgj?
+zAL<qC$By^)9PdlDV)eBQP^sQdG$Pn~`&#<Cj&=9?JMgq%@9pz-bstI<*7P0i5v+Z_
+zmezJZbp#!9479iOb+-FbW$b4H_*N&!LjFKB%0~pv*idk~X2Zrn1XBRhBjWLF*f<tC
+z6B?Tc$Unz1et{9(8xp~pm`c!2b+-t=XSfr<q`;=?XZA)lK2=ofQ%7|^4c4PpaJP?#
+zqvvR4b?~UPo#!X{>4Uz&C{3xer$V$qJ(J-OFV3GZKN*}F!eqhK5IxBjC3_UBBJ_M1
+zD>4)uJLkR1bzjvBM!%oB>h}v~zkeK$;@$j$)$jl6RDit%emVU9Va)pI*yu!PViFe&
+zet&Rs2$?*;pRJD}HXfrVF@GX{KVOM=x=ZgVv@}j(dPf?cJ3Sc;@so|1OrZcjbgFTT
+zz=wY*1AO>t{x)Jr8)Ycq4WHvHP!CJ?A`{Ue`RClvv`6?&^7St@t_L0%R~HRw_hhtV
+za%v(dj_US|QI%m1hM79%86F+OB4=yPb28+iH^4}G+1qyWRn#4Naj|3dl=I5T0c28L
+ze@rYvH~X-9^ni`iSc~|XIy7QVb$14twApbessYu-=En)l4~8Ao$Z1nKT`H$%IRow*
+zQ#ljMnWK821=p?g>lszl;G<GDcFzus0L%^iY4kaxCZ7v)Fh|h)LL&eZ)78CU%rbyI
+z!U<7KuSp(1B-rc;0o;yZCVB<kFkpC8FpLGF{_)WXDHC`enaK(13T1FbGdd9!%$P-d
+z)PD|hLokLWf?`g6ym#6r!>p$xQT_x$si_G-9l?%jSt&msm>3BS(Rz~B6i0LeMo@LP
+zgpFQ5_l&yfk2o%fYbD$hs#7YT%BOBr;mtI^qOyV>Xl9C^5VYNs6Cw5y*>{=bf!iWf
+zYXwi=la_@9a%qvc#X<3=U+hD%$T}o5+<i`~YggT2X)G$9*_UU1MG<z;m&Sk7-6dpZ
+zxPGojyq=NbszeK=Uv7GX<3{j`CG?aw{f?N&RsDlk>8YTVo*FdCcYT~pyPZ<uDaHrL
+z_fmD?nYBmOx>QPCjH1v?SL0iGPSP@qc*dt9Q4g?|C-nSK2rCOyK)U6fu2N>f1LfpN
+z;q9(9@Y~Q4emf;QDA|cbF!u+>rbOt-H__GINbni8AVP-ON30e<qRsCQPe!8tQIH7u
+zin*z;n0B=f&qlhD%y26f$Hl$p_r|KO)W21~WT{@L`k?-5{q@{`U-Iutmg?GX<&-Rz
+zwkL8r7OfprbpQGNvA!!O-a4^lsblwA6FF^**0wtu&bmol_?4))yVlHaz?r8-#}nnx
+zZ=|Fa3BlVm%no?Ehi(!0;}20%M+w!E25Pp@PfDmnq!r1_+}~<9-?rs^qkCmd;&gxG
+z*oxitjiW22<uiw7Pb9SED@DaK-E*x8ZSj4rGHu2Bsn(43MY9TXR&}=u8Je@%)|XG?
+z)B1EieIsEp1OFI`(mEqB!ul!LB+4oR<T4ie+{p+LTIKZ~qE}Av`|-%<)^O09!hO=x
+z<XdnjZC&yQ@tY;j&<#QiwEPNHZCHMku2^$cHI%vSu3XhoW>wGWbM6=@E3V1(^+h-a
+z@29)_u9j*Vl;H~3pPJiYRllkSW!4@vDd|Y@at^lAs77}9@SK&~s#ey>U}}x_NL;pD
+zmd@p9lepYnQvbs0el?A(S6xqpgLL#*<eYLIOs!YBE%`~Ba+J@g0sUNi01`OYUc-}I
+zPtJo^WnK;SYQIFixewNWdI@f>IplilQ{RB&!Wxt<SW^%`L!~s<16zH%^d4j{+tkT%
+z^>(F>ux6k#{i&W}<({0Azb*R)`i#=q#-ET6JLK{2NnMfefVVR|vYz#FX}KPZF~jIM
+zn;!Xes!jRn-(xS#G?NA@eCG6CQ18-z*Qa3<d<&2KHp;o_eSC|w*&J4*&Wt+nT!m6z
+z&NTrJqP5J{xt=QdzH(+Qq|Knr)=-Bf{Yuu=^uRdcDeLe4RK3zE>N}&k`qe!$xJbLJ
+z$cuUiDXckscArC*m;k;yr|WtdudT4w9vQsiQe-q3@&r5*rkgJ9mH6`%AI>oHFk$Fs
+z50O5nLIIHLg62p|AChC;g0{8K_mrSJ*nX(1ySe*UfQwwWpgRe0J|Sq@yW0c}5VW8@
+z-rLe4Xa^3qbTg8UI92~>u<t6+aFCx2*XHpA2?c%V`BCulj6N3B;h<pT(V%}Qaz@Yx
+zBGGeTX0}o}!^u$eY$!C54dFASC}@W!!{-DIum-;iPl!m8Fh8RK1P8V1ms$EyM6eJ8
+zLbyK|dcIc6AEuH=s40-4X9VqdAaXiFFIQdd@rdMtLlk0&e9q)VgdfFihG#y;jGEy-
+zGjn-`vC>3t&CJmiOF`077PpioE#)^Y<+to*ixvBC*sj00=sA|K_beKFeqpv=-1N$(
+zx$%XTC9`*?b)~2@HZ>oLO)M8RB#XAki?)C7c%o>}OzUjkoNm@0*XG~0*k`9MG$$>k
+zaZ71z_{zjv6AQy1OkABvSoYn}+-U!iIeEYrKj2$2+ArGA+hh7G_P6YJHR=|X{vM~c
+z>Sx-3>x}l7zy8wKZyL&1jMll1H!ZO<SHAw%*W=EHWn;svcExPFP<zpP-kUHN&9vTj
+zubVsj=H8^cI_|E1H<EB~O1c~4?#65CW%stEyE*P|{=v3{dq4VUc<IQBD|hbrn?*@i
+zMch^K?zV)hCh6J~cWqiYxa?|7x^~80JHHo6xaf^^FFlTy=5}0|j<wDkzI|lbv2me4
+z*>Et9fA)jR=2i>`?(e$r0=oC&TQ9~P-fP>gO?|)l#=2ySFOGlPe9QLUWpf`oSx_A7
+z__ifkP!}(#dw*M^pz&Jewc+n?N^Wh7Z*BXyH?g&Axu6S;TI1Th6^lJ-Ss%BokG+tv
+z)F&-XaZA(n;G(4|VQF2|wu%G*fd?5x{F4bB1Ieo(sbP~5(>E}5dUAM}O=gjtamsQm
+zZ?7oFdL&6h0@?^cKO$+YD)${qV%t{fv~ZlA7WW-xS0AKgh@xPW%*U*PG)e|^g-<`2
+zqF{Wg%_-Uj)CMg99AWjKl;g7U5{fiBtWmg$e)TgRpC(1IX!|wUAgWK>ua&WT8TSQc
+zbeUy{lALZnI5j#J1UQq2QWgn%nD7r04lr>Lk_E;Zr13{d_Eo%s=1_YdL@K%{#AaiH
+zUApfd4h%sWDL4saPJtes<cC6IfKY-XK*G3C&_5oEo|+6sASbhcWARHB3fA!C<QTEB
+zk<sbUwDD9l8jdtKHclHThfJ+*^v^M=Mn9wEzfp3ZlHVYy)$=wCv0xI}e?TRIf})U9
+zFvzomh&VwvPE2pDjz5iG{204LJvb*ABx$H%2#8`iCS)MsB|$G6I(Itcmx}Q;nb?FH
+zL}rHjh1IoU&s)h~zf!pMRzdmvj`^BILEUF2olQT}{+X3?<R|UxZ`#)<?4FrJx9o-U
+zq3ab(_I)#lR<xFvkG^ztt}ZsRq^*{J)y4*vv>R3|IWyf4t|=n6Fx^yliHv#_)8I3J
+zc`*7+KC{o_v--4+27G!OV<PxJ!1Me#62W*f5DEDq1?GeFQ%m9l5e+;|zYUX9QGalh
+z7jce(1a!EfEXGGJz1L8S#0B2xid6Y`C|R+Uu4-_;ZFjBea0Ya>*jEjdGjgunRTJgR
+zoIPjNLOCmEcdyzgXXo^$I}YT;u}P8rXoMJXwoGq>%*WV(MF69qW~m0LdaFLH@7Ja+
+z-xLE;pGJE2i)Gd6*TRN=LpI?-Pl_c$+tLBX0<49+aLc%2BK8gPUFF=b_i6fdKHV+}
+zeC$#ARa5FIjX$NF3LE>4+1MGMzUfI>{7?+ym;Pi`P#NblR&sbQ?TzF%WzxHh8>B_U
+zj(&sBBm<BvJusoBEKCguC$mgAIk^rH*I{$NS*E{6@J1!vVYJb2>T$^}Dd&E(Oh%V+
+zhduP+)<5_bYv0OJ$$7X<3QLG@T*8g2%eYdmjQt%c+M_AuMpX|l<wHGkxxo|*){}*m
+z(sMzuHzi!y(r4(&S9&k!<k6JhI*2zd;ZU|vE}@*|vKaXkiQWT7Ywh8)K6P68lBF1x
+zuw}o+XRDNQqpDG<_qC4c10A90&?yh#v`nQo(AxF1_V#;0rIIWz;;ETDT~qI=86SmG
+zWnu(bXr5|9B>k@O3aZ9wtrzrSA89V2=>WiwKypZArGN4?F6u!Nh63aKAEKk9ZvftQ
+z3kInwL4Eclh+Ol~si}$6euCVBdh+!2I$7xK84f@o5%g?`G~>UZV{L-!Q*pHp5z^?z
+z76F(~1HK5F5dd$Cggk~I=oXwjiRTHCFuHLnB4{BOoe->}P@VXpGm4_ag6=F&zt5tJ
+zg3~9${&tAPn3jeo8dK0uO+e~?TF^toHUf&=a5lh`9<J6Z!a-8b@-vhW$m3t4gkD+D
+z04##&hRRIPg60hi>fuv@j=eHy_2-8ogjuTD0c4SeFXU11lPL5G3Na{HixHgRR&zM}
+zy4lC)0x|8}nb;Gt>Dbsp)uOo(gqtPjjow)9A3wEhSwH{y{N9D=V)^!E%l4VJ6|M2*
+z!!I39YV$ye#exfci`u*;?bcPbT?bg2d-3V>PsiNzeb;u)KAp7fS+ec99$j&`la8{u
+zqilZLlB0Sh-*aEb+4sh6djM-~uB5d*ZY^K3R^D>u%>`p^Nmu!jt9;%EVOFx#8!z=<
+zuURbhep-5PuKnlvC6}gF3W}~6-!jhU{Y%Fk9k;$!bzj5fRNObA$~#WZnTuRb1uFTR
+zUHa6vhh6>ew=C|Yr7CWz`V11>d=l;LIlt%PzE}3GSe+LSpFjNC(OV+Ly_ny4&Anu7
+z{+VOle_u7B?B|hZF>D{|OWIuAhZXMDeYy{K7%9KM3i%&a7Pr=!KGNh-T42PLk34ku
+zqdH4#v+biD?8-h%o89!WQH$#z+clKB^4c3TA6M^f->CV~Mji4Q5;^*q47qMb=1U+~
+z8MW#g^+2pvQ97r2Zt~=`BMSXz=xGS$>#;WZ6AHTJ*<2$`D^4>)AZ)Jv4jA<+o{1b`
+zeZ0?^R9%qIQMzI(Sk+MGHjt~1GWgPtoK*wM8VQ-2SQdEIy=q}uE1^>xWkr0Nj?YqL
+zZxw5*pF0bf%l9kzb0BA+e_;D|2?t{cRMU?^ksbC=O-%COd`Yu5$)67K&Cr>JLB)GE
+z5`dy1VOlmYwY5wKBCi&2t%@xcNIKu4abZLX8?e-pWXlw+>S!=RI8|DDvP@d8$d8Y}
+zzl-~9s6^%9suP68OI<T<w=4y*{Drn_XA_prMQta0alr(QAM|}7@ka0%j_v~)bAwO?
+zn;UzPdBoh%`t(4_;_T3Z^fH0?vXQKz(S$*AiUb%n!;^4al(RFwo3Y&NRgcn*)Kme$
+zV&fPQOp&2eP_B;wni7CgCe5@xI64#+1;3bfCmu<beIJiUP9h<WXtT<7hmsXj-l_)Y
+z+fMhY4rgfsQ4aHG{i=y_W|~wM%7H9%t=cGO=kSDsa!#6DF3RO_`rJEi<ix2((@8$0
+zm8QG<EljBl*|0_?4ZsUYgb~LLrlw^-NV;@+QO2DNX)a1;$Yy0CCv^rarXy_ha$(aT
+zO(u2><UFIQmw(_amj{{C&d3~Nk16f8l$8-YN_jc9P{J0rT>kS@|8YvaN8Qv6f(<e}
+zXqjx3mq;YYUys7#>oDYEAeFL^Yy*F`Ek&fF8~_s$ONS4MXN8QD+Yj3ZQ{>uUO77fm
+z?+5<~Qct@}8p*Ju-{j<uJEzoMZc5#ei#Kx)y5;xkcgSA>l5?k=?^Yj%Y?;~*yTVQ%
+z*`<+98tl;;HQ}7WJo#z4FAtKFAb(PXRKLq-1PN>!Op!~^sQPvCXg8|0T-Xi91%C=b
+z^rRc(i!lr5_UH8H?!maG&joz96j{r0Q<^C?NmdVI^;4hwb1LzsW%wU<j&ctt5|8W<
+zNyJ*q^kSQAN&|ZY{+#CwY)sN^Pza#a63InoC6Wye%mU2j;{YX|0L)KFD93nc($h_i
+zMMot_L&hn@_=*hov(IKi&S#(XL?+32#T+>W!Yue8pFSGFHP{7!iH8~)l`<O>Pat?E
+z0FxB79r1($pbtqeWFCf|E^;aq@tQ>vrynE3gNcA?L{=#KD&3!@<TXkbkO-EEsd2vq
+zh`PZ?(o_O*1h6A$rbokqj_HsE9jLMK2t<%!&}u=(Ec05b<XuWgj?L3V=V=uQ8gTuP
+zXEI>eL{}9M$e`bQbd6dU=`md-9GCzZ2=E>e3AR6_d#Sf!?;_~MPBI(<DFsO*=`=QW
+zPB4n}C1jW&ZAnZKp=m2paE##>$vB0SbEQy<gtQ|3bv(hKXCpueM3)}U;hx*|>NuEt
+ztMd)_TyLyoIj{PC%|h!n!=E3yUU@zA7j=n^?Fm;$!g^??{dPqaaF8=^?zx30zFYsP
+zvk{`h^6K}B-zolArEzQNZ0n_xxeY6h+)o{q^O~fi@}{G5#hH8Aa>)|wiyi*dx$&-!
+zt7wEK)U_E>Q%A|GlW5qMd&`)&;>=%h6;kTV|IDJd>t{MZg?YCotXr@4%@4gcFxUT@
+zKi2!Ht^8`=O#7mB>usBBZp+;0ylei@!V`<u#+mkCm~t<cUMRigE`qvqRin){-(FX?
+zs>As+Jy%!~Yl)rx6UQ9`e$N^~0h;sg+BtXetbWC4n;pJri@BDKMHg)7oVysf!|Iwj
+z^4njRa<*;vjVODu^z#Ve(I4(FYTKdxXh%U?v+m<&OS{>Wfof^80Q9TwdXRYts#Q0_
+z)b6TQQi_uOS12-Vf~Hfn^J1dHN20;MM;j4R4iOsEfDXFD(wJ$Lo##iz-y#Z=PzFkK
+zoFv`U-Mz^k29KY9mlXlx0(uh<8Hj#qDFTcum>dBkK}T5iXccExX@q)^mK-~J2<@&p
+z8Wn*h)XcKf0%VF|x}$Y61Q8w?_%TD2dH@;7{rNKlxgw(@qD^BkGz7>s7OD4;mLN>`
+z$mnSlCR4*>fsu%J+Who0n;Uj}2OBn>5IE9e=%Bz3Jum2oSpB%5XUt&)WM2T?6S+eO
+zfx}~gAuxKlB$%U<et;i*;~_yk5f(HP0hrtI|0mruFtf@~FhYY}Es5+be&q@N6Wm}Q
+z`f+4txZC#Ji{t0V-)@COE@`id+pCiH`nbJ*;l%ZWH-d}y`h@*3)|ACYj7lv3O4(aw
+z3l;C5{9yR%@IpzVaOd^smlVqJpFVZ@{{y{w<OIEgLa7O=Q?+7(QW~pWW#<Kx`1>If
+z^y>^v{r)Ft8hw@$!^zW}Ca)~mVp{&xLcr@tN7m`etR23@vsq{`2*IQ!n2nP18S_*2
+zIao}orO=b6zm|JO_5xXZr&DOEZ2J4O#RQ>i+G4Uyx3`k*FClbVMMI<EQAv9^JQ^Ac
+z*298FTsu)7bDowQm4ta9<~+n4Fytk>97t^XI{3dtH>VBaqB_C<1%CAjDleOd@(U0M
+z1vRI-dlH!p`Z^sXN#CSKdMXG?tOVW&+1`9D-7SxFCD+FRSg84*ppxcp28+94Bx{D*
+z^8_#^8OLgw5&$@RbOHh+)${3QM8>^if$@{Uz+*xg%os63esOfXdzoot<S}H#0{75B
+zWCMGhA3T2Jt3Rnq?mc#M@395<2L)FPu9aUq`27ukR<>B%zj(YKDO(Qw4HV};L;^dZ
+z6lCE)qN^l)6F^P?PzgGW{n$AMX!wum=8q`(F%lWXs3IA_#g@@mK8ccSnf^0m0A3)`
+zu${NPF_bVCC5`Lj#`Q^Kb=+7zA9=s^d)7q#z8l9EjnxU`;hB~dqv@jVypD>`JvU#m
+z&^BvJ7`G_bE$1yTCo&d@)x^vC6UKp=78x?Rt`xpiIDhbc^#}T^`uV+y!p+wUmMjMs
+zwFebwAgu_FX2h34s#-#-P?9``@`9F(S_S>&$>(71%J8Wy*<c1nOtMjlf?(TQaLQ^-
+z^jo?C8XN<2pR<toAIaSCDxK!b*e|8GD8>${x4OF>=>M0Vzu+yH6(13%YYv$wk>|R|
+zf01o)cHulM{8ch9Lh$RE4BLuqD@1M~toErg^mr)*3;Qlm+(B^q=%otW3XO_%WP@0#
+z8lmHp`yDJ`Ps2AT<LQUIG1=s7qi?F6-rY;nolKgKw6=M=TaLDSHrBLu^*!bBdcF0Y
+z-agOq-kMriIsp7^90CRxB{iX1FM~3Isvhfs;0;TldiyVw4<f-zf^IMj(=>5KX~tk~
+zu!I|!Nk3)x$&Ma`JJm{sVe>2Kqm!pY6A@9_rcm4#KgvSvOLLF^1s-NI=o~UowOJsn
+ze7iMi@!Yg{7PKFjubMxw{%h-sBX8CwNfcw6*b@nB*-ZP2#X0A?&~)*!^N%Gg#So!d
+z?KADS4CdJ#-<Y0z;*VZjajl#C>YD|Z*I!znaFx&Me{OND<QB!YyxDd6*rj8M+zqp+
+z!ZEvNQM*o=pug*K%Airz!C_J2vmY<>NW^bITd9TPP<iigNMa?cbXurqzm$HVLUyF6
+zQV)PT(azbZ($vICLk8JQUx5bKh+8sgQo37>X1`zwsk|y^x1<rvCN%M-mPYu2ma>`8
+z_N1}*()&ULA)_LtH*3tnQUVeA83=WxES?dKz_@IBD!EioN-(0-0LM3z{BEd)8F678
+zvXCWSIISI1A+;Zavz$y6&>Qy<@44ns#^hl-r-$j7Sk1+2s>M$TB+Xu!Tgkl!NN`O5
+zy^qY5JYc6m*Nd(Xq~VQtrou82LLNf(p3|WaqwR?-ISG9TWDi3S@_Jxo#C(V#@#td@
+zLRjG$3Nh7>M8!}Ao{hn%mo9ItIaO0zyT=n4p9H6nvMFM9M2P4iXQcpKBuL`HT7aB`
+z8YMLsSb|Bo<B;GagN7mj$f*G1OQ`5@=q!3@mK0SGfPlh+<U`QXt3ll~`g|zJ-@uRn
+zoVDP@{}2hWA(1JJLsU?m613ESp!0{J2g4n006H;23z#&4UnV%JK(v8=;0J8!$EL<7
+zBDEU+S5((OQu1pgwVJ-Zj#@iEL>CwnV*yJ7ABYg^hMw4^i2yWScqKn0?;?Ua2t^YO
+zlVE^#_r%oLn4lkxu(KvIH7*!N_{pj8$#bBoVBy6NQ`IMsTvhSE#3`M!a>BeK5*UXX
+z!Y}%G@oFqZ22^gLDAZ7P4rWyO=ks4JoH=;Q<-WZB_4V`W`JLZ2U)yz~X~}hD=HSd3
+z7#o=^7Yol9#&*Uw&K4$2l}S@$+|+nYpD^v3Ik@6-!w{<Ia_Obgq^mOSs+@04xHd`;
+z=H$-xzgd^esfy=RC3329_3TTB@x<lAOND=2e7WpW*?eHGOev3s)}LR0vtY~3eLb`5
+z6Q(CnKdu#>FPiH}n2M7oPu%25m@1McZ`|Zfm^R}+c(h&Tcf}6P_b(RL&+bZC8Wyz;
+z3RskY52wW&e;MkBfouN%M(Ia_=R(w-0?%fZ{SJp@?#L>g<_Fm?r5~t}9q0q~LwENN
+z@ic+wHPURU7%Vx{FnStb%aC_MzMW$2vAoS|o?+5YJey%j{D^0m2MnIcu>Dnp7;9Q!
+zUNR`1Va5A}rI{xUN@v*WDwa`e>NbdoCDVfS3rkBtJkyd_5tyv0oB8kb6W?N)u4^IM
+zp9rFc=w!o#K93QQLmnoG@bdqF&m*X!BjQ&&a6r%m!%^tL;lXw`G9sv<ABGJjk~5=`
+z5x(TFzFP8Ef4d(7Rze><3BLJUN+3k%coj__nx2wBg@yFlkT6G~O6RS(!RFUI3V@*y
+zSJ~UoEvMF&!!=iV;cP7T!q?|(m+kdfTalLz(Q0gevoO}T3{CFnvJ(qrX6mJ`6%?+z
+z@ci4g%Z^H1iN4gi;>?-b@uunRu4U(j%rcvn9dsqF%;9BcjZ{W@>hWbKEoQ3OVw>qw
+zW;wkM9eVs{tE~!|hY0Y9*VmF~!&N=wHy8|K6p~;h7>OZ~jFOnc6aA`0jSu5Cs%cou
+zS+n;+C}CA1ncGW5lYIf^emLEzWEaJ5(}I)_soT1{zrmFmZXjc^Wuv2%sV>tXFsg^+
+zVZB@<&OUWL)hivim%e26=@avzOoetJgI&Nf($E6QysAw2Y*s^{=CtHYB2ysgJsFVb
+zI4lW6U>nA;Rh*2He{yd&hu<kOC}F4>-e@DE(J5F*(^qSlCR7cBO`uXx1;lF5WzhWN
+zVQ3{l9%S<(-Z(J{|G;x&qa&xHo(RL`wO&sjusKN)$lKT~R_Osf0DhgHe4c!!K_)P#
+z=u{W#&1PaHq_X=wz?T!jjh>AgQNpvyv!!Wstp^U8o^3lfdm6-_b)K!;J&o*2t;h2;
+zVavz~vza;Pp?xy%20tRTJ2o1Ew1ym>_j!(hV`@mfDIs9Yo8bde=F9=XE&6B5Z{VkK
+z;Qt?#B9elftAFWY$N#n;d{O|{nLZctQR=ivGgv`0&|`2Xjs{SQD(4;eLc9|RTxTaI
+zz@W3imaG<2HrM7cnDOB8spt@2g2HTVhytP2T+U*<uqkOSiJME_KAtdF!uZ7Lo(sXK
+zd1~2FHIJnJTFJ8gv81g%Zfj524$X9|cq+bYojJH@D2Z!JSKN7T?tQo7y~gh}UaP(y
+zS*mDVcDK$PeCf#T-xEyW?evn5TJKFLlv?k0mE#VFWNvJgP76cqbfcGDe8_qy!swB_
+zl4f9Q2FsleIq*&BP|#Bf9)NZK9pHg310EQ}TGLaRBMIvUwxsuF&?uM6#y4T*!_8H(
+zNlb@N16v4=^pks;K5!HRA+LOz;$+!NY(TaJn{D~07JZkrX5jkYJUlfq)cmY67oYWd
+z1}MG&QR*O2$pu&jAL8@Bza>mfuqBuRA`BGKQl_=LkFDcPGO+j}5HuP=paOCX2U|pe
+z9H8k9pOdt+o-m>nFd#&4f_lj*6YvEA4B*sk=5uHgyD6b%&*xDt9|?pfLv$fP$yQ1V
+z=oYaFJYjy^U%S%D>b8gq6(fldQi0kMpiZ)V!9o|I4FfVBlwoV*S(F2<PwV|+&H0*F
+zYngk%h5DqqG;S_^JCrb2eVL`7oB!s~cMraI>^sM<b=+_-RkbhYw$HS_1YZsN%;OJI
+z09v$)1@h%ocwdg*?xMGr<%s2~-FG-7voEaDY2M0yDg8k6?4VIXKXiAsNHgV#nUuG@
+zV1ZZ}D)c#EX#heEngTp29+}8ienLc@has0ED}!`<6uATwZe$V@S(dghW%-g#h(OCX
+zC69#nVzy<TRXhTvp3fkoe8?qJ!VpE1A@>t+91v|+`1XO;Z2FDe7>FQ59Pkg^o(_JF
+zs(c!Z6j8VA$mWAs&J8%T`5XF-a__PkNk3v#Ot>#;F$Nena(GCx_8@*JUA~${ATkK6
+z8}X1w0OsNPY$KZ~ZN(h1Frb;e>{>$2%F1#*WpZoE*+(KWn=FtCbA#pby?#Yk1uk*0
+zQocS|CFkTmXS`*Nd{;T+``hIf0OXxe>oQH0C{Gb31VPy%55yFMV<Z74;7P6lo{a$D
+zQcxDeGx3lG+IT?XhOB2p@G^#ymbsgeY<OC?{{{RBsux&T1~`&{kgA2!mwAf`s{KqL
+z%>ONl^8b|*Qq1y$NMJ#!!y@PPNCY*13Y=AtCxHcTq{KvtnGy>UP(A?>9tv9c?47C2
+zWoj6v>Sg>BB0`LgA@+u-?g>&OOGpG$i0P35&3RJ$^Z$(!CZ5qtb^}Bw@ym4i7nBe;
+z!00FbuPH|hhzVYxttJpHXuy}Ct5HGEgfkIAH7d!xNrD{_%@m0yl|i*$)E@El1sPN$
+zf*Z1J*ZLSgU;XXrgsTqh6+|z0)i$SoR`Xd2=UyK>`Rx%1QD)Vz8t#<hGOSL_d2_y3
+z%VrMVHd$u7mq|cU5jR!LZ%vr0MG?sYe{EO7v<G4mo8w~t`TmQ8=Lchz^TFA{gl*GI
+z$1Qis+x}184d)HBs+HoB_w4W3mx{f!!`~dec5qg6%bj<5_v^c3y&o8_8kgK#lJ2Is
+zyXksP!VRakwz#|PM(-yT3HMR-$OwzzTrVsHZI0P97amVqOXAj&x1UZ}YaxYqts{94
+z#OfvDORePOU#`7W8*6!!xK>Dn(ESVn6NFJF_uRo(*E8|XYr!}6LQTJHDNkA&;+BSM
+z+ZQbj2}{$Wwn+i^7(aFp6$Egty1NmXM=+kuM6*$gC1H}3T?oo?ia&}c1*<4%WRp7b
+zxjp4uBu3BBLv$HE75O|r6;wlx14IVDCq$QfQP5B8_F?SmIC>rtt&Q(<WvaY8l&qMG
+zRy8=^&hf13aE2j`t!mXkIV1Von~-}5HCvAn0IEaF;*rhbq&y8#DO{rrQhX{IV1zZr
+z={2ROOu266TF)sKCO$O+pD2odt)gZJashAx-P+faMd7|1;~<$tLME=Drff)Ppq&8f
+z;aUmMYZa8Mv?jkv25`(GZC9R1duM&WN`|9B0Bs<<;Y=Y~Hp#pa)F8c0hEPBntUcuV
+zM?i{08K}<`xIN5mKAYEw%oWJBiXmEvrXNfpo&J=bB&<(EGig`*)uC>&H`&m%T=&Rc
+zX+$!Fe%Tz$d#cvHHQXOb3by7@zF&XJ)HU1pqp_^yJlr6Ces;h^2PnJ*-amu1;Mvi$
+zNzN%}pP?^h##_eq!7#KG!oQR!jdA*a`e36eY8V1%Q@D_fI!Oosg#=t_JfQmtae~+v
+z<>?}>goNW5#ZD8kB3J{a3}9joGW^^FhG3#WdH@pq@c?W{`N^}QAcR>=p~92rp!Fct
+zhKJB7_#=u(_3X1EoO$+H;wwfF8x7&wSe!OEQ35R^@)ML0@b?jmc{YM$t2L8+Mb@Cy
+zBe2ydEI?sC%3@iKhsF^t4oVlEBsVApi#aGBz^2^8U}YGP5K+YpNQkB*NUFdSA_5_@
+zQz2FwUx++#yJ{#+l*yApoPg@#i;m$Fk==v#9Mc5)NL@C=U4P=^`kVViZ$~&C>4G#0
+zf&sRz7*6JGPGcjI7$k#bik9gd$-xMu3i~kdGOArCVseub>qNoX&(f1YN~qT&-v1Hh
+zevE{IsxV^*Eg7!BTZv+R@&6y)(ZFz&=}s8J=0B%v@FfKb5KM}n(Pg@9qHsLS?+C=f
+zPP`ybfRrcb#&;kQG<@JJPiCWxbdWt56w<(+Icoe76lFM~92uCJt^<m_c;uBM@8-Tc
+zmMGu0WZgc~zN&WX@^0Ck7f-)(I#%`WP<&hWlKt4M=I8FR+13?D&XrAXZTi%);Z||!
+zm7Q<xoYVX<L)RW)6}#(=+&9J&uF7RwRnoR8Zrk*|Ba60830upo`j-~ilDg-<ww${m
+znOhgnty|ce$ZcA7?Ve>ym!^wNvrTh+toqIAWd6o@{>DUpT{7Pr&-W(tH{Z<Pyy7mH
+zJ@N}%Y3yXeRz9n~Wh0FKm09(Q#dXtCI)C!LQ}3OcKSeE^dGqnhM=u>s=GMe>Ym&M3
+z@!b0N`>s|0*<d2KdD*oG%{g4Nrr+GM<bKAf@uEh1(pV5T7AzJvEJT-#+hHmDigi_o
+zTc0yb`meUPH*g=8wd}&_qx?FgAFEZAYBy23c`wo*HB@%EH9yW#A!XAZqstCLO^kpb
+zkosi^h?H|J{5zO?twSUxV99uvdCd|%A<hC~$NBfzPfDmML3<Jg;NtvfrrQg2ht1Lb
+zlmk3|v<U1X9!&YyZX=O566RlvGovAJW?y^NKsh7Kl~+xaGZS55p`4Z6H*A!He{Iek
+z2XZ2Xp+^toLmC|2-H)|2IEo)oI<um%%g}G9DY4{A6#cdg<Kc#&m)sE00<e=oF00@y
+zxE{cnfw>+SfCmgIYy@gNBLtVapUVsk)NerjMyY-<fnnpIMXq1L{&HU+DKqw~AhS!+
+zFlf0{YT1NmiTY=UjB~R(Ii!4E(_AV{aMg#mui_>FcL%l1ypp?v+=s9kEF1n5w}(N}
+z7_lQ8W-jNRG?TlL%tnVTY30*cV7U&wBV3ZwsTA@Lm!GD4gkTls*q5I!F9aP|hf%Z+
+z{2;xCY|QPTM{Y42bs)d(zz?Xk!)StuPpaf+d<AP-MQvZI)zpk#(?W$rFIuvPiSe0W
+z8<Ap^!xoH#E#nPAZ>~M$Ie@YbdW(L`pz`HGnTUtnkBr)~P$_b4Jq_}c${E%sPMIc0
+zYc8?1o<^mFoP(W7A+t6qg0)GG{8j0FdbY@AlrtRD=)Ea$up~xdCATRh<ebmpbD?CO
+z+zXV`$g402st&7AegUp$r~H(1rdcPC1ZyLE-;0l>Y=U}-&{%U|p07*m0erb7mmdA7
+zoHIVkxu;!q<f`P}Q!@ScqA*1C?ID5>iWgY4Jo~H!zlr#Q{x^UCjbouP*tk<<TQMlD
+zBoiTDA65y`R3Ow^dyY4-D19)Vn*`A)dHaa2KDbXFJ9|7Z!y87Gk(7u%U=}@vq;kXZ
+zbC5X`NjEhSI0Jub3YzNmv}J_XCCeNVOcUKl1~X<d$&mx@!o^aGx$8Ag>*~nad%CcD
+zk~u7qV^9R4h{*s*d~MjnC<F_`MgJNfpqm6aR@nPb@*y$ik7(&~1NZn3DS4Wbf1rd3
+zbN-QXtCWx(41bpriVA~jwA5QhZi*rw4PQrikIA(+Q4x(;+27JLBp!nLoYnp-y1*)?
+zI%~CkFs`{OncSqRs4bNuBaux_C<sN`$QT?!8A8SSm%NXNs1jX}{+g~44a#4mM3e%N
+z9~VSR_vs3;jG~O5C`G}*{2;b%6(vVZF!cXY38EAE|3S%bDG5<>0*PP(^~=H;pF<Fo
+zU{Eq{7Ae_b6o401H}!^%I-?B;$%+I4jlZB8Mifx`PJ)(B{P*Z0Vx5v?Nz@P!H5swt
+zvgpJ_v?LBuDd1p)G0`Eg-v#N<KZC-IUT|Z%gPtr=T$f5K=MTMi^qr&EY7$k=OQm}f
+z*1hr4Ju%g5y>qT__9IIkLwkR2ao)0*FIMflK63r3#fn1-d*`CD6JADnMR#omoBoa!
+zx!JbQES$;thJDFc2CK}K!VN3#!utlT$$ST4o{Cm&oX)(;q4Z}t5MnWZBUj!VBeAK)
+zbpzK-NIs5yvgMPJk6w(g8%VgGoYgZ=BRC+zUa9bv!nvIb+9gxNTB9YHEbSFVOt&2C
+z7t41g9lI7CyJj^jIk|7vT=rh_zMJ!2(K|(noO&ii({RqFUr@mVNymXj$AR>M?nKT8
+zxloHLC7_z$xmZ+3Mo^m|bo(OfrZ?K&E=%OrF1zZIt}SubmV|3t(zPq@+I9VjMc1x`
+zYriB06Rn*DW8=*|eXH=KD!9w3&H9;xpw!IPq^US=Dvk{<>|89_dVSrZsW@ReAeuwL
+zU@KOGo)p&2=Chvs(%`sdTbHy|-?UZF^9ftsteSevOsQZc)tEHxiJSJ^$Xzt;NtimA
+zP;I8`x4(wu(YEimzc%7C+{b5tbJi@}vxq-m$nDZ<KP)KkGHHKkEAO)F{)64pRc6XC
+z{f5Et3Bls;@wK=5JC3v*>dhdd370T3nvmcZk<k=77Au$x%|%zOW3&<~@$+F4v;Rob
+zoeXNooLol|GbFJfJ1GJ|+-C<71L%nE?jIpDgHS9A(W)44^k~Jx=_$}vx^XPkv*wUV
+zHyNo_au7`z<w6imfcPcR1cG?rMN`5C^>o)n*o$Z!Qzsdl>lvAXZ3AQgfe~0e!mg6U
+z<>b2gJc3(L&~*<h7V&Hhc}KjSUhwP_BW=VW*Lpi(55NYE0VlXz$dw942B=U{F!iBm
+zJH`9Bs^SmO;Nib)bmZ`lB2E(p8TPYQ_z~P>BTN(k)P`COI4+0#jf0nuzJ7Fm!}~cO
+z6kjb)<nBl~b}kxsicFbGmnS%KS2Z|)9<k!NKWx~{U9;@h{H1DtCU^Cvrv)ECKOQ+1
+zZqnPxQ$efRgW$lbJ@dKj^o3JFC4~t7Upf^)(J?7i%JwIlCtfzWXf~^4$g=1Y;>eU^
+z@%wNY!tB(H;Au??X4&F&=XO4X3nG@&1j3{6iN)NA2>F-<N+HN>&PlUj7{$}4OAbvJ
+zxujHP0%h2T=t74uW7Hbmp3E6jdKF>)b|oB5i^e8-#-NDn;+gYjF1~R7g`{I!+_CLi
+zd&1Ft)7VV&XwT;n2Wn&UXnRYI=EG_g(hLYgOO`<x4{P>|gXgBXvxxYz8xM$4<jl|W
+zEGRDQlpZ<Peo8|jYoE6glZ|Aqew9x1&Ft5MQ;rx}27NvTEFdtL&4`SmXnRwF&xb|B
+zg?^A;n;l@owt^v2L8qDpHWB5lh|@Fm*4ebniU41pT9Q^9Bt2uxXj!u(+ax7enW;_B
+zHf?3@Kxqq1HbDd&6bm++k-hv31iVTQa>QrSQ`Un_4SR|aQ_9J;$?wP_;AT+@C?X0a
+zTESpSh%Y~#!OmsTF3YWD6WA+)?yz={w2<uR@kp7p6LxjcBEqS<U(={ooGHROr9YSn
+zPhbS~105MXsz|Fu$|8uFUYS8OM}iP-fN@jCmZ;A)2gcTr^_v;`bv+x_6vj^|GqnAN
+zZHNpnk5pK9xL0Dnv&KJ6697Tb@zr5*MJR80OtnLwrXb3tHXxS47hwV+BLqT5jKZ_D
+z9<at_t~9M{R3k-dls!_jeUpL8G&>0sqH$y&LDlbb1bucIsevb|(bvN#r7_a=Y)tFA
+zl*Rj<#`~EEQ-XuRl$byXr<NLV%V48i$G}%I<^?Gm*BtUw^1uawQ=ycy^birS=AfuH
+zGUZdot*Kj{@@dcX>`MC~WfegHBASfLZ@osvMqJsNBW<2Gt+|Dt@>@X2CR(xUdcI_T
+zeCEMsxjq&s(I!XkL_|$px`+V|Gwr?*0&;{Y5HMq|6x%PdnFy@eYKHU>KrbnFT;|2o
+zcv?cTh(IZN1A{|`S3H<_awlPS2xOih=tcJsu;<D(9odgYx~KO)d><jtMp5~MJ%U8-
+z75x0fjeX#;PZ}e**2BD1G<}%Xw{|pa@iwvGo}<w*_~=Do4GSM$%P{ObruYz1lY)iW
+z2(le?5X+P2@divHP`h4aeTUFzo<O3gWC>7CpoGz>hCl=XCIjavD%&U`bz*M;aO?d4
+zqymf~C(un?FZN0i5CuTA8&N-xux-+C@=+Qy8!^@+6EG5|@e*|5(KC}#!6ff36X8ks
+zDf0eAq%h)F(1a%us6^a$Mn4rMVumbJq9BeSU?vlkU(!>J)BuYW0t%dhhmZj?0vp3M
+z2|hXz{xPbM^}@_P4Oyy3_;1kFpVIUH963e{lYyRmh&;IohI-Gl0pP!hQjD<Z1RjK$
+zzsZup_a#i*lBTA(sVQM<o;i5m%sJPCNwwH7*Ilan)KaptuHem)%M+I--tAAUtDimi
+z>LHk6IM;t><eWJdr(c<lRm29Di|Ud^TjE7q5=Gm7uye_AaHexbYke6(NB`*9Evx<F
+zp;r#g9V8V@GIv8fcLTyNC#)M0q6Ef*&F7ov#uApwciY}CO;qh#wlpOzkHszUr96<d
+zbjB^6pA;l4zL~aPkc-YMMX|2==dZ21p0`-Me~DPtU)qXbRpQEfGoKtR5g^23g*?Er
+z{#IW8<*&T{m3jU9!%KNPW;<Y-lC+h^p(*<6{O*O}#flw^>vtw>yIxV>L2S8V=p%C1
+zU2cB88L^mi^gnf%&IT6tf+4Q!`M4oo*Ap-Axu}{|T>{z2=^U#Z%G}j+&LWJHGv~7L
+zk}>wewf-BebH;?TGwJM!J9}1gU|hkuo=}0^c9~~&V7FnAQgW$;x@dpHyJYb^&_#Fk
+zf_^clkx2v`s2!25;KgKp!#b<I<y`-EWPbafoJ%-sXLYv_Tl(a;Pf>JfSgYK$G^|)%
+z7rV}P&5gvOOV+9tqxpi7!b>NOrEz0vEcB_d3UBEuh5jWkf9~9y(1LA@=WYa>1)ugr
+z?pBBj&cVh~tADxkrOua+y@dTHj@@$PujG1Ga!XcCoDMoMolcL(;oAzHejDDOO}igE
+zU587xKd#mz&7hklhWK~hbV8w>5v&8|x`=8Rq>0YdRG@Aj&8^un$0Ow^NsN0vQP4<;
+zg2rh<!%o+<?4n3Wqj>5dwwe*rKR{Cf=NIUn)Q#BGfFizTvv?tLr(GpVszFd?80lpb
+z0ECI`$}E+I&;}uvLR1QoB%>lCY>peIG>zcYI=~E^#XIpM17}XE5928!UZyl*=(8rB
+zX{aqL3HES{7?5Z>xlIr{I$3iBeU(DmfoxiP;5jF@0@PrmBBT5~uBGzXtTkYU3aCX#
+z*fh|!jW*H{4Q6#pATNc0?#V(J({?5@3E?xO^)RI|5$mTEc1i@r+411`QgmaPg&;+2
+z4^6K%$AeEbYSw<)i4?OSqW@<Q1cCf`h%8eKE}fV^9UF)U8~9Gv8HRBYEpI4H+CW_f
+z*_C44l<tMKYszGwUxb#}(L>!?bI_O1wy}Xs`N-cYt5r<O_9xqS9;}y}lIwt8QJGC%
+z`L1$CUo6>}QRtZL@>gOj;6D!>&8CaOn}DTVd&sS4>!U9frVd1O9SslktA%n63R(Qf
+zS?GME?#h}?8?|<n8_|pOubypQ4K!0f+f|1_<P!wQ4y}6j$Zw&X<<`Io;M=f~{Kvt4
+z^8J2C4@pwj9P;SNq`f2*sK7{3L~z?PTA$08)2JDEjCyq#UzPPq<#V%86<B*<1k^n(
+zYpTUhxi>wnUwjY2H4u1$Y3LZ78|7+q19mKv0gBiQVmXt7CPSV_ZSzQO=CDiN+6Mg?
+zVo^;*8zci{$;+E5%OcQqfG(%X5Rx9oSwxwinMB;a{v++(u<s%ns(BJ_U9>|-Gqio=
+z?aj0@&pr$9c05RGH=^Z18aA;wRtUf&?pY}9NIBIQINLaW)-0B$a$9!7Br6&knM8~#
+zwxuP)28*%%0-ncvk9B)$<lCW0jfY53w$mT{(h+-9Y90|+pvYqwTOL+Iu3*SicZo;Y
+ztD50@RoTQy>2??LSAQmD^#&_f)vu^Vkn0z5V#ph&Rw`^2GB!DRdMYf&x0zuys%XJg
+z3_=xqYYqj6A2i-7C1jq9iheW0&7XO1`km?TRbC7H@734KmumJh{4Ho{=mZlv_lTi9
+z{sP6pM<6Dc<n7Kg*2l)KjEfti!g$&vXs5?UPxc8W`hIK|NN`0kj3OgEs2`a#9;4Z}
+z>_qfwX~dxoBjGkbfJ8uGX_BGWRxk=%+|UzkVy8(&D;$q7!kurR;(khgL><#%4@h1N
+zHYS>Vna(hs8RA-t3P8q9(AXieAq#ZK{~SN~MM{X=7j=SOY9GFQ*usye-Ihcu=>@t9
+zR)%qo2!BEhB!U=5;Jc>_PQfjbVxdr!B>vw}btHus*%k8s1CJ753O~{6+$EA?b5!Ov
+zsuw%`AzC(OH2+<?c9@c_l>7_2%dFr@6-p7cgCb+2#gJ2+0c^`BMqVVI1zyYGN-pD>
+z2%*C@!4N$M6z)Zw6#TzMQAX4~hRJ|=@EPI>xaYRMS_&1Dr(&k_wjpQk<mItTW6OpL
+zazWm7;YCC<j5{h3@6hg?E50x(#$JP|d1d|kPcK#OUUD_ZD|f%OJ+@`8{PikiZ@QXi
+z^%R<*;PryHE3VXjt9HKiPrM7&*D4dPowx%U-}<_BsdVp>bKmvhgtI;AJQ8;v`J_ML
+z?3>lC6qm&sX4SKM&O2^f^WR>-U`Z5iPZl=C3!APN-#D2l>{_uFzP<Iz?r-gWxA*<x
+z#D*Q$`<IFlC#E>od*#Wuo_zOoqIB!3L0fL7N-j8-jHNJ{s@S-YyYL6sTNXW!%^K&5
+zLC62nv3~YNku$^FE?FvmYR$z9UpPzBZT7MkMlMdApTLVk>V58&b1^psZu*nrgkwX}
+zQ6G2IFZdFU&CplI9lL&@NjUa`uK?H6^?Fw<c;)n4r>|En<?cUkLRIekE5&aW&-cFf
+z)H_cl3LBG!JL82r5y-f3|6<O8S@n5?_@bIbVSTc2bG&f#wc_h|(Uui!!P`|=>b_Ms
+z-}m0r?>zmdC%_M`>NJITvkQjTY_JI{^33PX|G~AE#e$u)#@B3j3OQ%lY6-Wl;PT+5
+z!DL=dJg?@{yjtqSElW{s+m+pK?M_-YELk?Jtgo66E*!q@x_;=!Q;Vg?W;<W)1|zzz
+z4wV}1a|KI=LJY>m7tg<#aCpSmO*p)ZMlW+7|LxuVT+SZm&GuoT?QnrUgIgi033R{e
+zt_PVf(j$^<RJxR(*<BvR10r)0rlnAcpAXY2?jv|cv??(tZemW5EUv3wrSk&h`#3#B
+zzW<l#B$yIBFCN**Ly$+1l4DmGG)2dQhGQ&F9)bHchm2~&Al2zlChxJ;gZ4=kF*d<}
+zM~K>|gN!pH+Cw&SjFo?f$$eAW%4|MQ=<k=PZH?i&ZB5tlQ||p>im_3`OhWFzwv80I
+ztJE}5zUHm6XaLg5E-)pil?WQe*iK<vvJ#RopOaaV2YRGedLrk1EINfEp$19zV=xAq
+zfh{z;5|L#Ak!2cir}ylOzK8Tg6?*)LZ<4lsL{@g`(d}iL{>h|5)~};oQ(Lxg)6$<2
+zWjmY0M*0YVP<Lm3nSRCZk&F-49Awxif0;GC`NHpV_!F6ot>hja=NYD8-;qqg%+syM
+z5U&_ipF};1+lq_f=|K@va03vY5=|*no3ewnNK!_;2;0LbrtJVWgrU3n*9rW*O$kvu
+z{I@6}N{Igsa@YxD1}DKv+gdP0PvM8Ov~#;iQ;4LAC@ox~r<fR(;rS@llp;z*>f?Q?
+zOh=DLU>d*xp-3Xg<dtZ9{yh|XAnF?Hf+U#y_b9+XBI%OhnFbMG*(+tS-1*U@Y4fsa
+z^EKvCHgJC6)u(3FWSp}FVl<<B?&Ol8Am+cOzP9K4j^yU{_~!Pd(sptrYkIv2;n!yW
+z;KDI+---FgW$V_YwJC0GN?4meuKrA;rij9*rDT2V^tbmXiyPy`jn@jUKm8Yt$>yGT
+zbI<aYCl-r*A~wI(u;=>WL_=q?;YhsU$ci;TmILviS3=X0aP4&5Scj;?&N7CXzqvbB
+zvXJxV`5!<V{b}J&sZVdWU3vUlkI(bpJ^S9*-uc?K!R4BRiIUcz>|ApDX4_Ws3*S6@
+z`Grd_%=azy{&~#@-mBi_4Z9cDHP0SAf9O{2uIrja?cQYVfq3nK8^xcTOw>Lxd+@@c
+zi$~8NjcrO;t0C9}1~oIu-2F-n5r%HjwE6Q0-~#uK>ySnFR~E~ml7Cw0<A))<Zki{L
+zLU_G|@M!iB!ZWLmA*w8;4CPT~VXt`ML8M0r3g}LE_kXatp%~PpS%D*9;=>f#+3dn)
+zG?CQ_7-+K*$d9b#=)i_*DKH7p3so0D@78QcEDan((Yt1I(k#fzr&WT)4pb7LI=n>$
+zCJKP;$pQv}ETNuF2XwIDPPtvvJ*q3alG|s56L2b)9NsOL-jNQ-54DozIzZ!B+wgqK
+zf<!DqY34ijYoQt~6#E?3LB_Npy;s?gA1sEgX;!yc2oPo;E{%Ok9i|00ZzFXWJf{L{
+z6<i((dV&Wer5G`Rl4~*BT`mk;NH8ogSRDr!j?LeB)Gq489`Hoc;uRVH>q7=amedc7
+zW}1PPj3Q(?M-VIwBo|pd5agLAhOQN@W;866CAQ)`haeAv9x<%}@Bzb#g-Wx45gFrB
+z=A<J6`UhF#r<9e&;?!<P?(Mm`w`U>n!KtgK{_MF$@4#aJ08+NH)*90O1KyF@(DpI&
+zSiTqSLnlS>nE!y1VJgr@IYqy=OxOIB+^2+@rINV<Ge$)qi4-1CbX!b;McaOkMZ`!F
+zOh+ZMc-Y(%o?GJU@qdM;7_9gSDkMyhJJ**m6^W*ZW#`L~PnxRZrs{-gqZk?Pdf|;D
+zi%m}~ni>-(-^{_EJ4zo^T8&>Ck5>&O);+0ct)Pa<O^ZOM7;~<TKR0vmXZafvmfe@W
+zK3BeQ@`LBDK6kb3V#{pHrLWJlEn0SitGED76>T4S)3Y;S*_E`k#x1R%<StrT6PE5p
+zZTD|~t>LWAOil8`tvRjD+K)_nq#YTY2dzOsIn~_*?7hF(zKEpRsm)$2$V*$j_?+1C
+zg=A}H$X?u{mE&R5#dhuHk5G>BC@)ejNJ%$_db%j(Q@nN~?-OahLkm=%=xNc|i}{z4
+z|BzrL^J+gineAs)Qc{WJVZ6@}P1rFMB2-XIyblt#*Ei0$X{&FXftelHNr-aT2xjA|
+ziE`LS$hB&roajG9IXih5IVk7k;9caRTn=4xQ!bahi}H{Y@k&Z}g4PKwV#FWBD+5X(
+zUNXy&*e8@u9jR4sWo%6ff+>24Q!2>w)sJWFQWpeBhVcvZGUB1&lx$EIhBz8U{;kB)
+zkqPLdW~C;Dq-Flo4!MPX6ChF+?18IUSQ>2DqE;A~e(f_(8OpI;1EqdvY^kEbHZQt<
+z_(y@ol12f(7O8#tg5?Y<8s+gC0iM7J5UgNFPm!Ec&cJM%bnhaVM6jLs`jlER!LaY0
+zQY&hCbgg}BY8{1%Y|2R1H2s*k5i=Yvr0rKE`vp<@I>~%2;XeVtTWkq{-3F!+RSbc~
+zL=On;IZy*12g#-)g4pV`Pacu)($=654r2=fsP?_slX+|?=%=mjAcP$reI7CWMtK-t
+zuyy$!#)0|d!3!ak7Z)C_Ir59JNq!O14hD99l%DCpUA}^H^cfJ%4*sNMzmMJXP6z1+
+zPuv^ZNkrWKiIBMHgg_?xFuOQ46-5+KJwJ{O_(DJd40bTE!Foo(B3qaE|3EiJSfk_E
+zecB&ITff9l2Jhs3PRJ@j1opa<v<)o3gr^uBSVB>V@(MTzd8!lU&4>+TFu#26<#RLV
+z$nL-5aKe6M(Rk#xV_mFj_QjdbUp60nP5auDP~qRSmCpBn&%I>Zv1Hu&6YVDh|H(#5
+zdF!g)t=o0WSh!+!0H`Fbw8sfD7muAkwqkX!<dxpa&5s%8a}v2#E9=VcIgBPV+yd+<
+z<6g-v#w8Si`vC1{0s{ZOle6Yt>AZysj=pj<R&y<P*}9X39Q)0E!`fS)T6dxgr5k3O
+zK4*5qA6B<;txoPEr?Yjh=A-grq>zUn$1Br-;kdmYze!Hc98xd~{+K?78QdL0<6;}a
+zaR{6#Fy2rU-q^Lz2*rLFejpGm?a&<<gXJuuKd~UX5x<|WMLmMq?;oBb!x>y4$i*`j
+z4dDz&phF+w<Mg%uni{c?n3p+=K$HzQNL$(>?n)H?p%J!y4sFmFJq5|Q<l+L`U8+G(
+zl^Q4^l336oxJme&7{LBdsd7KvI!m|o5_88mPA%l)r$yHnA}IwY{q_b&1Mu>RL`R1r
+z%t1zQ$$RN~<(+YPz*tVm!M=#-$~G^}QZIRupJV&*imWZeOi$8V=|#7AF=z@wKAvRD
+zJV84#DkkAs(aQ!pQz=L$qg?=+@D(UwgbrISuvV1B>}ALaCTtjagl*`^U#8#2QxN;Z
+zM<ycJdfB#>o#Jmn?LQ@0!C80U3qtRL4IoWQ)(l!yE@(udBk%>oo{wGK9mn`~YLJ$(
+z;OfBY?Vdyx@RVZa^laO85u39m|1~Omg_3tExlRcL5u6y7<`<NsICCsEjTlbGLq7?B
+zFgI`Jn<FYDx~MQy0!+}|Z&LDaDPeRVkz{Pa0;wmFXY{Ego;U7A>@n;P_Za_=xPyOO
+z<Ub+(4XmnFs?XF$mG)jPr>gur&hj^${ckwi-*AqfapgbbN`J-`{G6+gbM=46<@^oj
+z#&x7Wr&}9;#?}6etNOpV%KPdZmHIxHk=&!7s~b79D`_gaX)22CNSMlJ^eYD2%P+qC
+z;>?RHCTG&L{-z1xd_5o<VaWn3mbpVPH@ca-VX+!v)_az;PpoLo;?9<kAZQC$IQ`3x
+zmmG73%hpTQC9d={y-Iad6|4J<qw{A*m1_TDK`s5-f5*<LEpt^%s{H$Er>b4G%29e(
+z!>J2a#S5Fcn(g;>g{n5y{l~D^_r3K+s{DJ+Z12Mgjv!0kN}gvWukb!?S$A(tMOy&f
+zv(gSL_ng?F;9d!$t>3FcOyB!Oh#h*r3ULMRRUqWp>Jb%JwQHri?mi35(#d|gb5Rqn
+zq00Nrn;ODrPn&ASGV4!pt@reBRk`Pclfpea%*O9Mr-JFry=PRAE#IprrhBytorPu3
+XN}YFws-k|e+KTQI^~4A>MmYWdF{N?=
+
+diff --git a/lcd/__pycache__/progress.cpython-314.pyc b/lcd/__pycache__/progress.cpython-314.pyc
+deleted file mode 100644
+index 0431344a2f3b2e9d99550cff3f767e2e59cd4158..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 20673
+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
+
+diff --git a/lcd/__pycache__/schema.cpython-314.pyc b/lcd/__pycache__/schema.cpython-314.pyc
+deleted file mode 100644
+index ab389176ac0c4c812fe35691ada50095ac068c36..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 5102
+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
+O9L{h2aOT=4!G8fMJ;yr$
+
+diff --git a/lcd/core.py b/lcd/core.py
+index e46d29c..07525c2 100644
+--- a/lcd/core.py
++++ b/lcd/core.py
+@@ -1,10 +1,14 @@
+ """
+ User-facing entry points for NOAA Local Climatological Data.
+ 
+-get_lcd_from_noaa   download, clean, and return records as netCDF or DataFrame
+-open_dataset        load a stored file as a pandas DataFrame or xarray Dataset
+-get_durations       per-station precipitation-event durations (savable)
+-get_lag             within-day lagged predictors (savable)
++get_lcd_from_noaa   download and clean records, returning an xarray Dataset
++open_dataset        load a stored netCDF as an xarray Dataset
++get_durations       per-station precipitation-event durations
++get_lag             within-day lagged predictors
++save_dataset        write a Dataset to compressed netCDF
++
++All routines return :class:`xarray.Dataset` objects. Records are indexed by
++(station, time); the station coordinate holds the NOAA identifier as a string.
+ """
+ 
+ from __future__ import annotations
+@@ -24,16 +28,20 @@ from .download import (
+     open_xarray,
+     read_netcdf,
+     to_netcdf,
++    to_xarray,
+ )
+-from .schema import BASE_URL, LAGGABLE_COLUMNS, STATIONS_FILE
++from .schema import BASE_URL, LAGGABLE_COLUMNS, STATIONS_FILE, get_freq_spec
+ 
+ __all__ = [
+     "get_lcd_from_noaa",
+     "open_dataset",
++    "save_dataset",
+     "get_durations",
+     "get_lag",
+ ]
+ 
++Freq = Literal["hourly", "daily"]
++
+ 
+ # ------------------------------------------------------------- Retrieval
+ 
+@@ -45,9 +53,9 @@ def get_lcd_from_noaa(
+     lat_max: float,
+     min_year: int,
+     max_year: int,
++    freq: Freq = "hourly",
+     months: Optional[Sequence[int]] = None,
+     classify_convective: bool = True,
+-    engine: Literal["pandas", "netcdf"] = "netcdf",
+     *,
+     country: Optional[str] = "US",
+     min_year_range: int = 1,
+@@ -57,40 +65,38 @@ def get_lcd_from_noaa(
+     scheduler: Literal["processes", "threads"] = "processes",
+     add_cities: bool = False,
+     keep_raw: bool = False,
+-) -> xr.Dataset | pd.DataFrame:
++    output: Optional[Union[str, Path]] = None,
++) -> xr.Dataset:
+     """Retrieve NOAA Local Climatological Data for a geographic region.
+ 
+-    Download station-year LCD files from NOAA, clean and subset the hourly
+-    observations, and return the result as either a pandas DataFrame or an
+-    xarray Dataset. Records are restricted by geographic bounds, calendar
+-    years, country, and optionally calendar month.
++    Download station-year LCD files from NOAA, retain only the records matching
++    the requested temporal frequency, clean and convert them to SI units, and
++    return an :class:`xarray.Dataset` with dimensions (station, time).
+ 
+     Parameters
+     ----------
+     lon_min, lon_max : float
+-        Western and eastern longitude bounds, respectively, in decimal
+-        degrees east. Longitudes west of the prime meridian are negative.
++        Western and eastern longitude bounds, respectively, in decimal degrees
++        east. Longitudes west of the prime meridian are negative.
+     lat_min, lat_max : float
+-        Southern and northern latitude bounds, respectively, in decimal
+-        degrees north.
++        Southern and northern latitude bounds, respectively, in decimal degrees
++        north.
+     min_year, max_year : int
+         First and last calendar years to include. Both bounds are inclusive.
++    freq : {"hourly", "daily"}, default "hourly"
++        Temporal frequency to retain. ``"hourly"`` keeps surface hourly and
++        synoptic reports (FM-12, FM-15, FM-16) and returns the hourly variable
++        set; ``"daily"`` keeps Summary of Day (SOD) rows and returns the daily
++        summary variable set. Records belonging to the other frequency, and all
++        monthly and normals rows, are discarded.
+     months : sequence of int, optional
+         Calendar months to retain, expressed as integers from 1 through 12.
+-        Filtering is applied during data cleaning to reduce memory use. If
+-        None, retain all months.
++        Filtering is applied during cleaning to reduce memory use. If None,
++        retain all months.
+     classify_convective : bool, default True
+         Whether to classify precipitation observations and add the resulting
+-        ``prec_type`` variable or column.
+-    engine : {"pandas", "netcdf"}, default "netcdf"
+-        Output representation. ``"pandas"`` returns a
+-        :class:`pandas.DataFrame`; ``"netcdf"`` converts the cleaned records
+-        to an :class:`xarray.Dataset`.
+-    outfile : str or pathlib.Path, optional
+-        Output path. For the pandas engine, the data are written as CSV using
+-        a ``.csv`` suffix. For the netCDF engine, this path is passed to the
+-        netCDF conversion routine. Parent directories are created
+-        automatically. If None, no CSV file is written.
++        ``prec_type`` variable. Applies to ``freq="hourly"`` only; ignored for
++        daily summaries, which carry no sub-daily present-weather groups.
+     country : str, optional, default "US"
+         Country code used to restrict the station inventory. Set to None to
+         disable country filtering.
+@@ -98,35 +104,38 @@ def get_lcd_from_noaa(
+         Minimum number of years for which a station must satisfy the requested
+         temporal coverage criteria.
+     stations_file : str or pathlib.Path, default STATIONS_FILE
+-        Path to the station inventory used to identify stations within the
+-        requested region.
++        Path to the station inventory used to identify stations in the region.
+     base_url : str, default BASE_URL
+         Base URL from which NOAA LCD station-year files are downloaded.
+     workers : int, default 8
+         Maximum number of concurrent workers used for downloading and cleaning.
+         Values less than one are treated as one worker.
+     scheduler : {"processes", "threads"}, default "processes"
+-        Dask scheduler used for parallel data-cleaning tasks.
++        Dask scheduler used for parallel download and cleaning tasks.
+     add_cities : bool, default False
+-        Whether to add ``city`` and ``state`` fields based on the station
+-        coordinates.
++        Whether to overwrite ``city`` and ``state`` using the nearest Natural
++        Earth populated place rather than the LCD station name.
+     keep_raw : bool, default False
+         Whether to retain downloaded source files after processing.
++    output : str or pathlib.Path, optional
++        If given, the Dataset is additionally written to this path as
++        compressed netCDF. Parent directories are created automatically.
+ 
+     Returns
+     -------
+-    pandas.DataFrame
+-        Cleaned LCD observations when ``engine="pandas"``.
+     xarray.Dataset
+-        Cleaned LCD observations converted to an xarray Dataset when
+-        ``engine="netcdf"``.
++        Cleaned LCD records with dimensions (station, time). Latitude,
++        longitude, elevation, city, and state are coordinates along the station
++        dimension.
+ 
+     Notes
+     -----
+-    The function may perform network requests and create files or directories
+-    on disk. Temporal filtering is applied after station selection and during
+-    cleaning of the downloaded observations.
++    Hourly timestamps are converted from Local Standard Time to UTC. Daily
++    summaries are keyed by their Local Standard calendar date and are not
++    shifted. The function performs network requests and creates temporary files
++    on disk.
+     """
++    spec = get_freq_spec(freq)
+     region = Region(
+         lat_min,
+         lat_max,
+@@ -144,59 +153,80 @@ def get_lcd_from_noaa(
+         workers=workers,
+         classify=classify_convective,
+         months=months,
++        freq=spec.name,
+         keep_raw=keep_raw,
+         scheduler=scheduler,
+     )
+     if add_cities:
+         df = add_city_names(df)
+ 
+-    return to_netcdf(df, engine)
++    ds = to_xarray(df)
++    ds.attrs["frequency"] = spec.name
++    if output is not None:
++        to_netcdf(ds, output)
++    return ds
+ 
+ 
+ # ---------------------------------------------------------------- Loading
+ 
+ 
+-def open_dataset(
+-    path: Union[str, Path],
+-    engine: Literal["pandas", "netcdf"] = "pandas",
+-) -> Union[pd.DataFrame, xr.Dataset]:
+-    """Load a stored LCD netCDF file.
++def open_dataset(path: Union[str, Path]) -> xr.Dataset:
++    """Load a stored LCD netCDF file as an xarray Dataset.
+ 
+     Parameters
+     ----------
+-    path : str or Path
+-        Path to a netCDF file written by :func:`get_lcd_from_noaa`.
+-    engine : {"pandas", "netcdf"}, default "pandas"
+-        "pandas" returns a long DataFrame (padding removed); "netcdf" returns
+-        the decoded (station, time) xarray Dataset.
++    path : str or pathlib.Path
++        Path to a netCDF file written by :func:`get_lcd_from_noaa` or
++        :func:`save_dataset`.
++
++    Returns
++    -------
++    xarray.Dataset
++        Decoded (station, time) Dataset. Categorical fields stored as integer
++        codes are decoded back to strings on read.
+     """
+     path = Path(path)
+     if not path.exists():
+         raise DataNotFoundError(f"File not found: {path}")
+-    if engine == "pandas":
+-        return read_netcdf(path)
+-    if engine == "netcdf":
+-        return open_xarray(path)
+-    raise ValueError(f"Unknown engine: {engine!r}")
++    return open_xarray(path)
++
++
++def save_dataset(ds: xr.Dataset, path: Union[str, Path]) -> Path:
++    """Write a Dataset to compressed netCDF and return the path."""
++    return to_netcdf(ds, path)
+ 
+ 
+ # ------------------------------------------------------ Event durations
+ 
+ 
+ def get_durations(
+-    data: Union[pd.DataFrame, str, Path],
++    data: Union[xr.Dataset, str, Path],
+     gap_tolerance_hours: float = 1.0,
+     sampling_interval_hours: float = 1.0,
+     output: Optional[Union[str, Path]] = None,
+-) -> Union[pd.DataFrame, Path]:
++) -> xr.Dataset:
+     """Per-station precipitation-event durations, in minutes.
+ 
+-    An event is a contiguous run of prec > 0; a gap exceeding
++    An event is a contiguous run of ``prec > 0``; a gap exceeding
+     ``gap_tolerance_hours`` terminates it. Duration is
+-    n_obs * sampling_interval_hours * 60, each observation representing one
++    ``n_obs * sampling_interval_hours * 60``, each observation representing one
+     accumulation interval (Eagleson 1972; Restrepo-Posada and Eagleson 1982).
+-    When ``output`` is given the result is written to netCDF and its path
+-    returned; otherwise a DataFrame with a 'duration' column is returned.
++
++    Parameters
++    ----------
++    data : xarray.Dataset, str, or pathlib.Path
++        An hourly LCD Dataset or a path to a stored netCDF file.
++    gap_tolerance_hours : float, default 1.0
++        Maximum gap, in hours, tolerated within a single event.
++    sampling_interval_hours : float, default 1.0
++        Accumulation interval represented by each observation, in hours.
++    output : str or pathlib.Path, optional
++        If given, the result is additionally written to this path.
++
++    Returns
++    -------
++    xarray.Dataset
++        Input variables plus a ``duration`` variable, in minutes.
+     """
+     df = _as_frame(data)
+     parts = [
+@@ -205,40 +235,65 @@ def get_durations(
+     ]
+     out = pd.concat(parts, ignore_index=True)
+     out = out.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
++    ds = to_xarray(out)
++    ds["duration"].attrs.update(long_name="Precipitation Event Duration", units="min")
+     if output is not None:
+-        return to_netcdf(out, output)
+-    return out
++        to_netcdf(ds, output)
++    return ds
+ 
+ 
+ # ------------------------------------------------------------ Lagging
+ 
+ 
+ def get_lag(
+-    data: Union[pd.DataFrame, str, Path],
++    data: Union[xr.Dataset, str, Path],
+     lag: int = 1,
+     output: Optional[Union[str, Path]] = None,
+-) -> Union[pd.DataFrame, Path]:
++) -> xr.Dataset:
+     """Within-day lag of thermodynamic and kinematic variables.
+ 
+-    Lagging is applied per (station_id, calendar day) so values never cross
+-    day boundaries; mid-day gaps are forward-filled within day. When
+-    ``output`` is given the result is written to netCDF and its path returned.
++    Lagging is applied per (station_id, calendar day) so values never cross day
++    boundaries; mid-day gaps are forward-filled within the day.
++
++    Parameters
++    ----------
++    data : xarray.Dataset, str, or pathlib.Path
++        An LCD Dataset or a path to a stored netCDF file.
++    lag : int, default 1
++        Number of observations to lag by.
++    output : str or pathlib.Path, optional
++        If given, the result is additionally written to this path.
++
++    Returns
++    -------
++    xarray.Dataset
++        Dataset with the laggable variables replaced by their lagged values.
+     """
+     df = _as_frame(data)
+     parts = [_apply_lag(g, lag=lag) for _, g in df.groupby("station_id")]
+     out = pd.concat(parts, ignore_index=True)
+     out = out.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
++    ds = to_xarray(out)
++    ds.attrs["lag"] = lag
+     if output is not None:
+-        return to_netcdf(out, output)
+-    return out
++        to_netcdf(ds, output)
++    return ds
+ 
+ 
+ # ============================== Internal helpers ===========================
+ 
+ 
+-def _as_frame(data: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
++def _as_frame(data: Union[xr.Dataset, str, Path, pd.DataFrame]) -> pd.DataFrame:
++    """Normalise Dataset, path, or frame input to a long DataFrame."""
+     if isinstance(data, pd.DataFrame):
+         return data
++    if isinstance(data, xr.Dataset):
++        df = data.to_dataframe().reset_index()
++        if "station" in df.columns:
++            df = df.rename(columns={"station": "station_id"})
++        if "prec" in df.columns:
++            df = df.dropna(subset=["prec"])
++        return df.reset_index(drop=True)
+     return read_netcdf(data)
+ 
+ 
+diff --git a/lcd/download.py b/lcd/download.py
+index 80b333a..1f2e765 100644
+--- a/lcd/download.py
++++ b/lcd/download.py
+@@ -1,11 +1,14 @@
+ """
+-Acquisition and cleaning for NOAA Local Climatological Data.
++Acquisition and cleaning for NOAA Local Climatological Data (LCDv2).
+ 
+ Station selection from the NCEI inventory, concurrent HTTP download via a
+-retrying requests session, hourly-only cleaning with SI unit conversion,
+-Local Standard Time to UTC conversion, deduplication of (station, time) pairs,
+-optional convective classification, and a compressed (station, time) netCDF
++retrying requests session, per-frequency cleaning (hourly or daily) with SI
++unit conversion, deduplication of (station, time) pairs, optional convective
++classification (hourly only), and a compressed (station, time) netCDF
+ serialization following the CF timeSeries convention.
++
++Hourly records are converted from Local Standard Time to UTC; daily summaries
++are keyed by their Local Standard calendar date without a UTC shift.
+ """
+ 
+ from __future__ import annotations
+@@ -30,22 +33,20 @@ from urllib3.util.retry import Retry
+ 
+ from . import classify as _classify
+ from .schema import (
+-    BASE_COLUMNS,
+     BASE_URL,
+     COORD_COLUMNS,
+-    HOURLY_REPORT_TYPES,
++    DAILY_TRACE_COLUMNS,
+     INCH_TO_MM,
+     INHG_TO_HPA,
+-    MEASURE_COLUMNS,
+     MILE_TO_KM,
+     MPH_TO_MS,
+-    OUTPUT_COLUMNS,
+-    RAW_TO_SHORT,
+     STATIONS_FILE,
+     STRING_COLUMNS,
+     TMP,
+     TRACE_INCHES,
+     WEATHER_COLUMNS,
++    FreqSpec,
++    get_freq_spec,
+     variable_attrs,
+ )
+ 
+@@ -137,6 +138,18 @@ def _make_session(retries: int = 4, backoff: float = 0.5) -> requests.Session:
+     return session
+ 
+ 
++# A requests.Session is not reliably picklable and cannot be shared across
++# processes, so each worker process lazily builds and reuses its own.
++_SESSION: Optional[requests.Session] = None
++
++
++def _get_session() -> requests.Session:
++    global _SESSION
++    if _SESSION is None:
++        _SESSION = _make_session()
++    return _SESSION
++
++
+ def _download_one(
+     session: requests.Session,
+     base_url: str,
+@@ -168,14 +181,13 @@ def _download_one(
+ 
+ def _download_job(
+     job: tuple[int, str],
+-    session: requests.Session,
+     base_url: str,
+     out_dir: Path,
+     timeout: float,
+ ) -> str:
+-    """imap_unordered worker: unpack (year, station_id) and download."""
++    """Worker: unpack (year, station_id) and download with a per-process session."""
+     year, sid = job
+-    return _download_one(session, base_url, year, sid, out_dir, timeout)
++    return _download_one(_get_session(), base_url, year, sid, out_dir, timeout)
+ 
+ 
+ def download_stations(
+@@ -190,9 +202,9 @@ def download_stations(
+ ) -> dict[str, int]:
+     """Download every valid (station, year) CSV concurrently.
+ 
+-    Uses a thread-backed multiprocessing pool with ``imap_unordered`` so the
+-    shared requests session is reused and progress advances as each file
+-    finishes.
++    Jobs are dispatched through a Dask ``delayed``/``compute`` graph. Each
++    worker process builds and reuses its own retrying requests session, so no
++    session object is pickled across the process boundary.
+     """
+     out_dir = Path(out_dir)
+     spans = dict(zip(inv["station_id"], zip(inv["begin"], inv["end"])))
+@@ -203,29 +215,23 @@ def download_stations(
+             if begin <= year <= end:
+                 jobs.append((year, sid))
+ 
+-    session = _make_session()
+     worker = partial(
+         _download_job,
+-        session=session,
+         base_url=base_url,
+         out_dir=out_dir,
+         timeout=timeout,
+     )
+-
+     tasks = [delayed(worker)(job) for job in jobs]
+ 
+     tally = {"ok": 0, "missing": 0, "error": 0}
+-
+     with ProgressBar():
+         statuses = compute(
+             *tasks,
+             scheduler=scheduler,
+             num_workers=max(1, workers),
+         )
+-
+     for status in statuses:
+         tally[status] += 1
+-
+     return tally
+ 
+ 
+@@ -239,7 +245,7 @@ def _to_numeric(series: pd.Series) -> pd.Series:
+ 
+ 
+ def _clean_precip(series: pd.Series) -> pd.Series:
+-    """Clean the precipitation field, mapping trace to the documented value."""
++    """Clean a precipitation-like field, mapping trace to the documented value."""
+     s = series.astype(str).str.replace("T", str(TRACE_INCHES), regex=False)
+     s = s.str.replace(r"[^0-9.]", "", regex=True)
+     s = s.str.split(".").apply(lambda x: ".".join(x[:2]) if isinstance(x, list) else x)
+@@ -278,16 +284,33 @@ def _resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
+     return df.drop(columns=["_p_ok", "_nan"])
+ 
+ 
+-def _convert_si(df: pd.DataFrame) -> pd.DataFrame:
+-    """Apply LCD-to-SI unit conversions in place."""
+-    df["prec"] = df["prec"] * INCH_TO_MM
+-    df["t"] = (df["t"] - 32.0) * (5.0 / 9.0)
+-    df["dpt"] = (df["dpt"] - 32.0) * (5.0 / 9.0)
+-    df["ws"] = df["ws"] * MPH_TO_MS
+-    df["wsg"] = df["wsg"] * MPH_TO_MS
+-    df["sp"] = df["sp"] * INHG_TO_HPA
+-    df["stp"] = df["stp"] * INHG_TO_HPA
++def _convert_si_hourly(df: pd.DataFrame) -> pd.DataFrame:
++    """Apply hourly LCD-to-SI unit conversions in place."""
++    for col in ("t", "dpt", "wbt"):
++        df[col] = (df[col] - 32.0) * (5.0 / 9.0)
++    for col in ("ws", "wsg"):
++        df[col] = df[col] * MPH_TO_MS
++    for col in ("sp", "stp", "alt", "pchg"):
++        df[col] = df[col] * INHG_TO_HPA
+     df["vis"] = df["vis"] * MILE_TO_KM
++    df["prec"] = df["prec"] * INCH_TO_MM
++    return df
++
++
++def _convert_si_daily(df: pd.DataFrame) -> pd.DataFrame:
++    """Apply daily-summary LCD-to-SI unit conversions in place.
++
++    Heating and cooling degree days are left in their reported unit
++    (degree-days on a 65 degF base) as this is base-unit specific.
++    """
++    for col in ("tmax", "tmin", "tavg", "dpt", "wbt"):
++        df[col] = (df[col] - 32.0) * (5.0 / 9.0)
++    for col in ("ws", "wsg", "ws_sust"):
++        df[col] = df[col] * MPH_TO_MS
++    for col in ("stp", "sp"):
++        df[col] = df[col] * INHG_TO_HPA
++    for col in ("prec", "snow", "snwd"):
++        df[col] = df[col] * INCH_TO_MM
+     return df
+ 
+ 
+@@ -305,7 +328,6 @@ def lst_to_utc(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"):
+     offset = (((lon + 180.0) % 360.0 - 180.0) * (24.0 / 360.0)).round()
+     df["local_standard_time"] = df[time_col]
+     df[time_col] = df[time_col] - pd.to_timedelta(offset, unit="h")
+-
+     return df
+ 
+ 
+@@ -326,32 +348,28 @@ def to_local_time(df: pd.DataFrame, time_col: str = "time", lon_col: str = "lon"
+     return out
+ 
+ 
+-def _clean(df: pd.DataFrame) -> pd.DataFrame:
+-    """Clean one resampled station frame into the base (unclassified) schema."""
+-    df["prec"] = _clean_precip(df["prec"])
+-    for col in (
+-        "t",
+-        "dpt",
+-        "rh",
+-        "wd",
+-        "ws",
+-        "wsg",
+-        "sp",
+-        "stp",
+-        "vis",
+-        "lat",
+-        "lon",
+-        "elev",
+-    ):
+-        df[col] = _to_numeric(df[col])
+-
+-    df = _convert_si(df)
+-
++def _split_present_weather(df: pd.DataFrame) -> pd.DataFrame:
++    """Split HourlyPresentWeatherType ('au|aw|mw') into the three groups."""
+     wt = df["weather_type"].fillna("").replace("", "?|?|?")
+     groups = wt.str.split("|", expand=True)
+     for i, name in enumerate(WEATHER_COLUMNS):
+         col = groups[i] if i in groups.columns else ""
+-        df[name] = pd.Series(col, index=df.index).fillna("").replace("?", "")
++        df[name] = (
++            pd.Series(col, index=df.index).fillna("").replace("?", "").str.strip()
++        )
++    return df
++
++
++def _clean_hourly(df: pd.DataFrame, spec: FreqSpec) -> pd.DataFrame:
++    """Clean one resampled station frame into the hourly (unclassified) schema."""
++    df["prec"] = _clean_precip(df["prec"])
++    numeric = [c for c in spec.measure_columns if c != "prec"] + ["lat", "lon", "elev"]
++    for col in numeric:
++        df[col] = _to_numeric(df[col])
++
++    df = _convert_si_hourly(df)
++    df = _split_present_weather(df)
++    df["skyc"] = df["skyc"].fillna("").astype(str).str.strip()
+ 
+     names = df["name"].apply(_parse_name)
+     df["city"] = names.str[0]
+@@ -359,35 +377,76 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
+ 
+     df = df.dropna(subset=["prec"])
+     df = lst_to_utc(df)
+-    return df[list(BASE_COLUMNS)].reset_index(drop=True)
++    return df[list(spec.base_columns)].reset_index(drop=True)
++
++
++def _clean_daily(df: pd.DataFrame, spec: FreqSpec) -> pd.DataFrame:
++    """Clean daily-summary rows into the daily schema (Local Standard date)."""
++    df = df.copy()
++    for col in spec.string_measures:
++        df[col] = df[col].fillna("").astype(str).str.strip()
++    for col in DAILY_TRACE_COLUMNS:
++        df[col] = _clean_precip(df[col])
++    numeric = [
++        c for c in spec.measure_columns if c not in DAILY_TRACE_COLUMNS
++    ] + ["lat", "lon", "elev"]
++    for col in numeric:
++        df[col] = _to_numeric(df[col])
++
++    df = _convert_si_daily(df)
++
++    names = df["name"].apply(_parse_name)
++    df["city"] = names.str[0]
++    df["state"] = names.str[1]
++
++    df["time"] = pd.to_datetime(
++        df["time"], format="mixed", errors="coerce"
++    ).dt.normalize()
++    df = df.dropna(subset=["time"])
++    return df[list(spec.base_columns)].reset_index(drop=True)
+ 
+ 
+ def read_and_clean(
+     path: Union[str, Path],
+-    report_types: frozenset[str] = HOURLY_REPORT_TYPES,
++    freq: str = "hourly",
+     months: Optional[Sequence[int]] = None,
+ ) -> pd.DataFrame:
+-    """Read one raw station CSV and return a cleaned hourly frame.
++    """Read one raw station CSV and return a cleaned frame for ``freq``.
+ 
+-    Only schema columns are read; non-hourly summary rows are dropped by
+-    report type. When ``months`` is given, only those calendar months (UTC)
+-    are retained, which reduces memory during retrieval.
++    Only the schema columns for the requested frequency are read. Rows are
++    filtered by report type (hourly report types for 'hourly'; SOD summary rows
++    for 'daily'). When ``months`` is given, only those calendar months are
++    retained, which reduces memory during retrieval.
+     """
+-    empty = pd.DataFrame(columns=list(BASE_COLUMNS))
++    spec = get_freq_spec(freq)
++    empty = pd.DataFrame(columns=list(spec.base_columns))
+     try:
+-        raw = pd.read_csv(path, dtype=str, usecols=lambda c: c in RAW_TO_SHORT)
+-        for col in RAW_TO_SHORT:
++        raw = pd.read_csv(path, dtype=str, usecols=lambda c: c in spec.raw_to_short)
++        for col in spec.raw_to_short:
+             if col not in raw.columns:
+                 raw[col] = np.nan
+-        df = raw[list(RAW_TO_SHORT)].rename(columns=RAW_TO_SHORT)
++        df = raw[list(spec.raw_to_short)].rename(columns=spec.raw_to_short)
+ 
+-        if report_types:
+-            df = df[df["report_type"].isin(report_types)]
+-        if df.empty or df["prec"].isnull().all():
++        if spec.report_types:
++            report = df["report_type"].astype(str).str.strip()
++            df = df[report.isin(spec.report_types)]
++        if df.empty:
+             return empty
+ 
+-        df = _resample_hourly(df)
+-        df = _clean(df)
++        if spec.name == "hourly":
++            if df["prec"].isnull().all():
++                return empty
++            df = _resample_hourly(df)
++            df = _clean_hourly(df, spec)
++        else:
++            df = _clean_daily(df, spec)
++            # Robust selection: retain only rows carrying at least one daily
++            # measurement, independent of the exact report-type string.
++            num = df[list(spec.measure_columns)].apply(
++                pd.to_numeric, errors="coerce"
++            )
++            df = df[num.notna().any(axis=1)]
++
+         if months is not None and not df.empty:
+             df = df[df["time"].dt.month.isin(list(months))]
+         return df
+@@ -398,7 +457,7 @@ def read_and_clean(
+ 
+ def clean_directory(
+     raw_dir: Union[str, Path],
+-    report_types: frozenset[str] = HOURLY_REPORT_TYPES,
++    freq: str = "hourly",
+     workers: int = 8,
+     classify: bool = True,
+     months: Optional[Sequence[int]] = None,
+@@ -406,44 +465,38 @@ def clean_directory(
+ ) -> pd.DataFrame:
+     """Clean every CSV under ``raw_dir`` in parallel, dedup, and classify.
+ 
+-    Cleaning is CPU-bound, so a process pool is used; it falls back to a
+-    thread pool if processes are unavailable. Deduplication keeps one record
+-    per (station_id, time).
++    Cleaning is CPU-bound, so a process pool is used by default. Deduplication
++    keeps one record per (station_id, time), preferring the record with the
++    fewest missing measurements. Convective classification is applied for the
++    hourly frequency only.
+     """
++    spec = get_freq_spec(freq)
+     raw_dir = Path(raw_dir)
+     files = [str(f) for f in sorted(raw_dir.rglob("*.csv"))]
+     if not files:
+         raise EmptyDataFrameError(f"No CSV files found under {raw_dir}")
+ 
+-    tasks = [
+-        delayed(read_and_clean)(
+-            file,
+-            report_types=report_types,
+-            months=months,
+-        )
+-        for file in files
+-    ]
+-
++    tasks = [delayed(read_and_clean)(file, freq, months) for file in files]
+     with ProgressBar():
+         frames = list(compute(*tasks, scheduler=scheduler, num_workers=max(1, workers)))
+ 
+     df = pd.concat(frames, ignore_index=True)
+     df["time"] = pd.to_datetime(df["time"], errors="coerce")
+-    for col in MEASURE_COLUMNS + ("lat", "lon", "elev"):
++    for col in spec.measure_columns + ("lat", "lon", "elev"):
+         df[col] = df[col].astype(np.float32)
+-    for col in WEATHER_COLUMNS + ("station_id", "city", "state"):
++    for col in spec.string_measures + ("station_id", "city", "state"):
+         df[col] = df[col].astype(str)
+-    df = df.dropna(subset=["prec", "time"])
++    df = df.dropna(subset=["time"])
++    if spec.name == "hourly":
++        df = df.dropna(subset=["prec"])
+ 
+-    df["_p_ok"] = df["prec"].notnull()
+-    df["_nan"] = df[list(MEASURE_COLUMNS)].isnull().sum(axis=1)
++    df["_nan"] = df[list(spec.measure_columns)].isnull().sum(axis=1)
+     df = df.sort_values(
+-        ["station_id", "time", "_p_ok", "_nan"], ascending=[True, True, True, False]
++        ["station_id", "time", "_nan"], ascending=[True, True, False]
+     )
+-    df = df.drop_duplicates(["station_id", "time"], keep="last")
+-    df = df.drop(columns=["_p_ok", "_nan"])
++    df = df.drop_duplicates(["station_id", "time"], keep="last").drop(columns=["_nan"])
+ 
+-    if classify:
++    if classify and spec.name == "hourly":
+         df = _classify.add_precip_type(df)
+ 
+     df = df.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
+@@ -470,8 +523,25 @@ def _is_datetime_dtype(dtype) -> bool:
+         return pd.api.types.is_datetime64_any_dtype(dtype)
+ 
+ 
++def _is_string_dtype(dtype) -> bool:
++    if dtype == object:
++        return True
++    try:
++        return bool(pd.api.types.is_string_dtype(dtype)) and not _is_datetime_dtype(
++            dtype
++        )
++    except TypeError:
++        return False
++
++
+ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
+-    """Reshape a cleaned frame into a CF timeSeries Dataset (station, time)."""
++    """Reshape a cleaned frame into a CF timeSeries Dataset (station, time).
++
++    The station identifier is retained as a string coordinate so that leading
++    zeros in NOAA station IDs are preserved. Present-weather and other string
++    fields are kept as readable strings; compact categorical encoding is
++    applied only on write (:func:`to_netcdf`).
++    """
+     df = df.drop_duplicates(["station_id", "time"]).copy()
+ 
+     # Coerce pandas string / extension columns to numpy object so xarray and
+@@ -485,18 +555,19 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
+     stations.sort()
+     times = np.sort(df["time"].unique())
+ 
+-    meta = df.groupby("station_id")[list(COORD_COLUMNS)].first().reindex(stations)
++    coord_cols = [c for c in COORD_COLUMNS if c in df.columns]
++    meta = df.groupby("station_id")[coord_cols].first().reindex(stations)
+ 
+     ds = xr.Dataset(coords={"station": stations, "time": times})
+ 
+-    for c in COORD_COLUMNS:
++    for c in coord_cols:
+         values = meta[c].values
+         if c in STRING_COLUMNS:
+             values = np.asarray(values, dtype=object)
+         ds = ds.assign_coords({c: ("station", values)})
+ 
+     value_cols = [
+-        c for c in df.columns if c not in ("station_id", "time", *COORD_COLUMNS)
++        c for c in df.columns if c not in ("station_id", "time", *coord_cols)
+     ]
+     for col in value_cols:
+         pivot = df.pivot(index="station_id", columns="time", values=col).reindex(
+@@ -513,9 +584,8 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
+             attrs.pop("units", None)  # CF datetime encoding owns 'units'
+         ds[name].attrs.update(attrs)
+ 
+-    ds["station"] = ds["station"].astype(np.int64)
+     ds.attrs.update(
+-        title="NOAA Local Climatological Data (hourly, cleaned, SI units, UTC)",
++        title="NOAA Local Climatological Data (cleaned, SI units)",
+         source=BASE_URL,
+         featureType="timeSeries",
+         Conventions="CF-1.8",
+@@ -523,14 +593,15 @@ def to_xarray(df: pd.DataFrame) -> xr.Dataset:
+     return ds
+ 
+ 
+-def to_netcdf(df: pd.DataFrame, engine: str) -> Path:
+-    """Write a cleaned frame to compressed (station, time) netCDF.
++def _encode_for_netcdf(ds: xr.Dataset) -> tuple[xr.Dataset, dict[str, dict]]:
++    """Return a copy of ``ds`` with compact codes and its netCDF encoding.
+ 
+-    The 2D present-weather fields are stored compactly to avoid VLEN string
+-    overhead: ``prec_type`` becomes a CF int8 flag variable, and au/aw/mw
+-    become int16 categorical codes with a JSON 'categories' attribute.
++    ``prec_type`` becomes a CF int8 flag variable; every other object-dtype
++    field (present-weather groups, sky condition, daily weather) becomes int16
++    categorical codes with a JSON 'categories' attribute; float fields are
++    stored as compressed float32.
+     """
+-    ds = to_xarray(df)
++    ds = ds.copy()
+     encoding: dict[str, dict] = {}
+ 
+     if "prec_type" in ds.data_vars:
+@@ -547,27 +618,41 @@ def to_netcdf(df: pd.DataFrame, engine: str) -> Path:
+         }
+         encoding["prec_type"] = {"zlib": True, "complevel": 4}
+ 
+-    for col in WEATHER_COLUMNS:
+-        if col not in ds.data_vars:
++    for name in list(ds.data_vars):
++        if name == "prec_type":
++            continue
++        var = ds[name]
++        if not _is_string_dtype(var.dtype):
+             continue
+-        dims = ds[col].dims
+-        raw = ds[col].values
++        dims = var.dims
++        raw = var.values
+         flat = pd.Series(raw.ravel()).fillna("").astype(str)
+         cats, inv = np.unique(flat.values, return_inverse=True)
+-        ds[col] = (dims, inv.reshape(raw.shape).astype("int16"))
+-        ds[col].attrs = {
+-            "long_name": variable_attrs(col).get("long_name", ""),
++        ds[name] = (dims, inv.reshape(raw.shape).astype("int16"))
++        ds[name].attrs = {
++            "long_name": variable_attrs(name).get("long_name", ""),
+             "categories": json.dumps(cats.tolist()),
+         }
+-        encoding[col] = {"zlib": True, "complevel": 4}
++        encoding[name] = {"zlib": True, "complevel": 4}
+ 
+     for name, var in ds.data_vars.items():
+         if _is_float_dtype(var.dtype):
+             encoding[name] = {"zlib": True, "complevel": 4, "dtype": "float32"}
+ 
+-    if engine == "pandas":
+-        return ds.to_dataframe().reset_index()
+-    return ds
++    return ds, encoding
++
++
++def to_netcdf(ds: xr.Dataset, path: Union[str, Path]) -> Path:
++    """Write a Dataset to compressed (station, time) netCDF and return the path.
++
++    Present-weather and other categorical string fields are stored compactly to
++    avoid VLEN string overhead (see :func:`_encode_for_netcdf`).
++    """
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    enc_ds, encoding = _encode_for_netcdf(ds)
++    enc_ds.to_netcdf(path, engine="netcdf4", encoding=encoding)
++    return path
+ 
+ 
+ def open_xarray(path: Union[str, Path]) -> xr.Dataset:
+@@ -584,11 +669,11 @@ def open_xarray(path: Union[str, Path]) -> xr.Dataset:
+             "long_name", ""
+         )
+ 
+-    for col in WEATHER_COLUMNS:
+-        if col in ds and "categories" in ds[col].attrs:
+-            cats = np.array(json.loads(ds[col].attrs["categories"]), dtype=object)
+-            ds[col] = (ds[col].dims, cats[ds[col].values])
+-            ds[col].attrs["long_name"] = variable_attrs(col).get("long_name", "")
++    for name in list(ds.data_vars):
++        if "categories" in ds[name].attrs:
++            cats = np.array(json.loads(ds[name].attrs["categories"]), dtype=object)
++            ds[name] = (ds[name].dims, cats[ds[name].values])
++            ds[name].attrs["long_name"] = variable_attrs(name).get("long_name", "")
+     return ds
+ 
+ 
+@@ -600,9 +685,11 @@ def read_netcdf(path: Union[str, Path]) -> pd.DataFrame:
+         if col in df.columns:
+             df[col] = df[col].apply(lambda v: v.decode() if isinstance(v, bytes) else v)
+     df["time"] = pd.to_datetime(df["time"], errors="coerce")
+-    df = df.dropna(subset=["prec"])  # drop (station, time) padding cells
+-    cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
+-    return df[cols].sort_values(["time", "lat", "lon"]).reset_index(drop=True)
++    if "prec" in df.columns:
++        df = df.dropna(subset=["prec"])  # drop (station, time) padding cells
++    lead = [c for c in ("time", "station_id", *COORD_COLUMNS) if c in df.columns]
++    rest = [c for c in df.columns if c not in lead]
++    return df[lead + rest].sort_values(["time", "lat", "lon"]).reset_index(drop=True)
+ 
+ 
+ # ================================ Orchestrator =============================
+@@ -617,9 +704,10 @@ def build(
+     scheduler: str = "processes",
+     classify: bool = True,
+     months: Optional[Sequence[int]] = None,
++    freq: str = "hourly",
+     keep_raw: bool = False,
+ ) -> pd.DataFrame:
+-    """Select, download, clean, and optionally serialize LCD records."""
++    """Select, download, and clean LCD records at the requested frequency."""
+     inv = select_stations(region, stations_file)
+     if inv.empty:
+         raise EmptyDataFrameError("No stations match the requested region.")
+@@ -640,6 +728,7 @@ def build(
+         )
+         df = clean_directory(
+             raw_dir,
++            freq=freq,
+             workers=workers,
+             scheduler=scheduler,
+             classify=classify,
+diff --git a/lcd/schema.py b/lcd/schema.py
+index d650eaa..5249de0 100644
+--- a/lcd/schema.py
++++ b/lcd/schema.py
+@@ -1,37 +1,62 @@
+ """
+-Static configuration for the LCD package: endpoints, the hourly column
+-schema, short and long names with SI units aligned to the project's existing
+-station files, and the present-weather code groups used for optional
+-convective classification.
++Static configuration for the LCD package: endpoints, the hourly and daily
++column schemas, short and long names with SI units, the present-weather code
++groups used for optional convective classification, and a small per-frequency
++specification registry (:data:`FREQS`) that drives acquisition and cleaning.
+ 
+-Unit provenance (NCEI, Local Climatological Data Dataset Documentation):
++Available raw columns are those distributed in the NCEI LCDv2 station-year CSV
++files; a representative file ships under ``lcd/data/example_download`` together
++with the LCD documentation PDF. The mappings below select the hourly and daily
++subsets used by this package.
++
++Unit provenance (NCEI, Local Climatological Data v2 Dataset Documentation):
+ temperatures in whole degrees Fahrenheit, wind speed in miles per hour, wind
+-direction on a 360 degree compass from true north (000 = calm), precipitation
+-in inches with "T" marking a trace (< 0.005 in), station, sea level, and
+-altimeter pressures in inches of mercury, and visibility in miles. All fields
+-are converted to SI on ingest.
++direction on a 360 degree compass from true north (000 = calm), precipitation,
++snowfall, and snow depth in inches with "T" marking a trace (< 0.005 in),
++station, sea level, and altimeter pressures and the 3-hour pressure change in
++inches of mercury, and visibility in miles. All measurements are converted to
++SI on ingest.
+ """
+ 
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
+ from pathlib import Path
++from typing import Mapping
+ 
+ # ----------------------------------------------------------------- Endpoints
+ 
+ TMP = Path("/tmp")  # node-local scratch
+ 
+-# Packaged station inventory (lcd/data/airports.stations).
++# Packaged data (station inventory and example download).
+ DATA_DIR = Path(__file__).resolve().parent / "data"
+ STATIONS_FILE = DATA_DIR / "airports.stations"
++EXAMPLE_DIR = DATA_DIR / "example_download"
+ 
+ BASE_URL = "https://www.ncei.noaa.gov/data/local-climatological-data/access"
+ 
+-# ----------------------------------------------------- Raw -> internal names
++# ----------------------------------------------------------- Unit conversions
++
++TRACE_INCHES = 0.005  # documented trace value (inches)
++INCH_TO_MM = 25.4
++MPH_TO_MS = 0.44704
++INHG_TO_HPA = 33.8639  # 1 inHg = 33.8639 hPa
++MILE_TO_KM = 1.609344
+ 
++# ----------------------------------------------------- Shared column groups
++
++# Per-station coordinate columns (single-valued per station).
++COORD_COLUMNS: tuple[str, ...] = ("lat", "lon", "elev", "city", "state")
++
++# Present-weather groups (au | aw | mw) parsed from HourlyPresentWeatherType and
++# retained verbatim for user-defined classification.
++WEATHER_COLUMNS: tuple[str, ...] = ("au", "aw", "mw")
++
++# ================================ Hourly schema ============================
+ 
+ # Station identity and hourly fields only; daily, monthly, normals, and
+ # short-duration columns are discarded on read.
+-RAW_TO_SHORT: dict[str, str] = {
++HOURLY_RAW_TO_SHORT: dict[str, str] = {
+     "STATION": "station_id",
+     "DATE": "time",
+     "LATITUDE": "lat",
+@@ -41,50 +66,119 @@ RAW_TO_SHORT: dict[str, str] = {
+     "REPORT_TYPE": "report_type",
+     "HourlyDryBulbTemperature": "t",
+     "HourlyDewPointTemperature": "dpt",
++    "HourlyWetBulbTemperature": "wbt",
+     "HourlyRelativeHumidity": "rh",
+     "HourlyWindDirection": "wd",
+     "HourlyWindSpeed": "ws",
+     "HourlyWindGustSpeed": "wsg",
+     "HourlySeaLevelPressure": "sp",
+     "HourlyStationPressure": "stp",
++    "HourlyAltimeterSetting": "alt",
++    "HourlyPressureChange": "pchg",
++    "HourlyPressureTendency": "ptend",
+     "HourlyVisibility": "vis",
+     "HourlyPrecipitation": "prec",
++    "HourlySkyConditions": "skyc",
+     "HourlyPresentWeatherType": "weather_type",
+ }
+ 
+-# Surface hourly and synoptic report types (METAR, SPECI, SYNOP). Daily and
+-# monthly summary rows (SOD, SOM) are excluded by this filter.
++# Surface hourly and synoptic report types (SYNOP, METAR, SPECI). Daily (SOD)
++# and monthly (SOM) summary rows are excluded by this filter.
+ HOURLY_REPORT_TYPES: frozenset[str] = frozenset({"FM-12", "FM-15", "FM-16"})
+ 
+-# Per-station coordinate columns (single-valued per station).
+-COORD_COLUMNS: tuple[str, ...] = ("lat", "lon", "elev", "city", "state")
+-
+-# Numeric measurement columns carried as float32.
+-MEASURE_COLUMNS: tuple[str, ...] = (
++# Numeric hourly measurement columns carried as float32. 'ptend' is a
++# categorical pressure-tendency code (0-8) but is stored numerically.
++HOURLY_MEASURE_COLUMNS: tuple[str, ...] = (
+     "t",
+     "dpt",
++    "wbt",
+     "rh",
+     "wd",
+     "ws",
+     "wsg",
+     "sp",
+     "stp",
++    "alt",
++    "pchg",
++    "ptend",
+     "vis",
+     "prec",
+ )
+ 
+-# Present-weather groups retained verbatim for user-defined classification.
+-WEATHER_COLUMNS: tuple[str, ...] = ("au", "aw", "mw")
++# String hourly measurements stored as categorical codes in netCDF.
++HOURLY_STRING_MEASURES: tuple[str, ...] = WEATHER_COLUMNS + ("skyc",)
++
++# ================================= Daily schema ============================
+ 
+-# Final cleaned schema, in output order. 'prec_type' is appended when
+-# classification is applied.
+-BASE_COLUMNS: tuple[str, ...] = (
+-    ("time", "station_id") + COORD_COLUMNS + MEASURE_COLUMNS + WEATHER_COLUMNS
++# Station identity and daily-summary fields (populated only on SOD rows).
++DAILY_RAW_TO_SHORT: dict[str, str] = {
++    "STATION": "station_id",
++    "DATE": "time",
++    "LATITUDE": "lat",
++    "LONGITUDE": "lon",
++    "ELEVATION": "elev",
++    "NAME": "name",
++    "REPORT_TYPE": "report_type",
++    "DailyMaximumDryBulbTemperature": "tmax",
++    "DailyMinimumDryBulbTemperature": "tmin",
++    "DailyAverageDryBulbTemperature": "tavg",
++    "DailyAverageDewPointTemperature": "dpt",
++    "DailyAverageWetBulbTemperature": "wbt",
++    "DailyAverageRelativeHumidity": "rh",
++    "DailyAverageStationPressure": "stp",
++    "DailyAverageSeaLevelPressure": "sp",
++    "DailyAverageWindSpeed": "ws",
++    "DailyPeakWindSpeed": "wsg",
++    "DailyPeakWindDirection": "wd",
++    "DailySustainedWindSpeed": "ws_sust",
++    "DailySustainedWindDirection": "wd_sust",
++    "DailyPrecipitation": "prec",
++    "DailySnowfall": "snow",
++    "DailySnowDepth": "snwd",
++    "DailyHeatingDegreeDays": "hdd",
++    "DailyCoolingDegreeDays": "cdd",
++    "DailyWeather": "wt",
++}
++
++# Daily summary report type (Summary Of Day).
++DAILY_REPORT_TYPES: frozenset[str] = frozenset({"SOD"})
++
++# Numeric daily measurement columns carried as float32. Precipitation, snowfall,
++# and snow depth accept the documented "T" trace marker.
++DAILY_MEASURE_COLUMNS: tuple[str, ...] = (
++    "tmax",
++    "tmin",
++    "tavg",
++    "dpt",
++    "wbt",
++    "rh",
++    "stp",
++    "sp",
++    "ws",
++    "wsg",
++    "wd",
++    "ws_sust",
++    "wd_sust",
++    "prec",
++    "snow",
++    "snwd",
++    "hdd",
++    "cdd",
+ )
+-OUTPUT_COLUMNS: tuple[str, ...] = BASE_COLUMNS + ("prec_type",)
++DAILY_TRACE_COLUMNS: tuple[str, ...] = ("prec", "snow", "snwd")
++
++# String daily measurements stored as categorical codes in netCDF.
++DAILY_STRING_MEASURES: tuple[str, ...] = ("wt",)
++
++# ------------------------------------------------- Object (string) columns
+ 
++# Object-dtype columns coerced before reshaping and stored as netCDF
++# categorical codes. A superset over both frequencies; membership is checked
++# against the frame at run time.
+ STRING_COLUMNS: tuple[str, ...] = (
+-    ("city", "state", "station_id") + WEATHER_COLUMNS + ("prec_type",)
++    ("city", "state", "station_id")
++    + WEATHER_COLUMNS
++    + ("skyc", "wt", "prec_type")
+ )
+ 
+ # Columns eligible for within-day lagging (CAPE originates from ERA5 and is
+@@ -98,49 +192,73 @@ UNITS: dict[str, str] = {
+     "lat": "degrees_north",
+     "lon": "degrees_east",
+     "elev": "m",
++    # hourly
+     "t": "degC",
+     "dpt": "degC",
++    "wbt": "degC",
+     "rh": "%",
+     "wd": "degrees",
+     "ws": "m/s",
+     "wsg": "m/s",
+     "sp": "hPa",
+     "stp": "hPa",
++    "alt": "hPa",
++    "pchg": "hPa",
+     "vis": "km",
+     "prec": "mm/hr",
++    # daily
++    "tmax": "degC",
++    "tmin": "degC",
++    "tavg": "degC",
++    "ws_sust": "m/s",
++    "wd_sust": "degrees",
++    "snow": "mm",
++    "snwd": "mm",
++    "hdd": "degF-day",
++    "cdd": "degF-day",
+ }
+ 
+ LONG_NAMES: dict[str, str] = {
+-    "time": "Observation Time (UTC)",
++    "time": "Observation Time",
+     "station_id": "NOAA Station Identifier",
+     "lat": "Station Latitude",
+     "lon": "Station Longitude",
+     "elev": "Station Elevation",
+     "city": "Station City",
+     "state": "Station State",
++    # hourly
+     "t": "Air Temperature",
+     "dpt": "Dew Point Temperature",
++    "wbt": "Wet Bulb Temperature",
+     "rh": "Relative Humidity",
+     "wd": "Wind Direction",
+     "ws": "Wind Speed",
+     "wsg": "Wind Gust Speed",
+     "sp": "Sea Level Pressure",
+     "stp": "Station Pressure",
++    "alt": "Altimeter Setting",
++    "pchg": "3-Hour Net Pressure Change",
++    "ptend": "Pressure Tendency Code (0-8)",
+     "vis": "Horizontal Visibility",
+-    "prec": "Hourly Precipitation Intensity",
++    "prec": "Precipitation",
++    "skyc": "Sky Condition / Cloud Layers",
+     "au": "Automated Present Weather (AU group)",
+     "aw": "Automated Present Weather (AW group)",
+     "mw": "Manual Present Weather (MW group)",
+     "prec_type": "Precipitation regime (convective | stratiform | none)",
++    # daily
++    "tmax": "Daily Maximum Air Temperature",
++    "tmin": "Daily Minimum Air Temperature",
++    "tavg": "Daily Average Air Temperature",
++    "ws_sust": "Daily Maximum Sustained Wind Speed",
++    "wd_sust": "Daily Maximum Sustained Wind Direction",
++    "snow": "Daily Snowfall",
++    "snwd": "Daily Snow Depth",
++    "hdd": "Heating Degree Days (base 65 degF)",
++    "cdd": "Cooling Degree Days (base 65 degF)",
++    "wt": "Daily Weather Type (GHCN-Daily WT codes)",
+ }
+ 
+-# Conversions from LCD reporting units to SI.
+-TRACE_INCHES = 0.005  # documented trace value
+-INCH_TO_MM = 25.4
+-MPH_TO_MS = 0.44704
+-INHG_TO_HPA = 33.8639  # 1 inHg = 33.8639 hPa
+-MILE_TO_KM = 1.609344
+-
+ # --------------------------------------------------- Convective classification
+ 
+ # Present-weather tokens (au | aw | mw groups) treated as convective. See the
+@@ -161,3 +279,77 @@ def variable_attrs(name: str) -> dict[str, str]:
+     if name in LONG_NAMES:
+         attrs["long_name"] = LONG_NAMES[name]
+     return attrs
++
++
++# ============================ Frequency registry ==========================
++
++
++@dataclass(frozen=True)
++class FreqSpec:
++    """Per-frequency acquisition and cleaning specification.
++
++    Attributes
++    ----------
++    name : {"hourly", "daily"}
++        Temporal resolution identifier.
++    report_types : frozenset[str]
++        LCD report types retained for this frequency.
++    raw_to_short : Mapping[str, str]
++        Raw NCEI column names mapped to internal short names.
++    measure_columns : tuple[str, ...]
++        Numeric measurement columns carried as float32.
++    string_measures : tuple[str, ...]
++        Object-dtype measurement columns stored as netCDF categorical codes.
++    """
++
++    name: str
++    report_types: frozenset[str]
++    raw_to_short: Mapping[str, str]
++    measure_columns: tuple[str, ...]
++    string_measures: tuple[str, ...]
++
++    @property
++    def base_columns(self) -> tuple[str, ...]:
++        """Cleaned output columns, in order, before optional classification."""
++        return (
++            ("time", "station_id")
++            + COORD_COLUMNS
++            + self.measure_columns
++            + self.string_measures
++        )
++
++
++FREQS: dict[str, FreqSpec] = {
++    "hourly": FreqSpec(
++        name="hourly",
++        report_types=HOURLY_REPORT_TYPES,
++        raw_to_short=HOURLY_RAW_TO_SHORT,
++        measure_columns=HOURLY_MEASURE_COLUMNS,
++        string_measures=HOURLY_STRING_MEASURES,
++    ),
++    "daily": FreqSpec(
++        name="daily",
++        report_types=DAILY_REPORT_TYPES,
++        raw_to_short=DAILY_RAW_TO_SHORT,
++        measure_columns=DAILY_MEASURE_COLUMNS,
++        string_measures=DAILY_STRING_MEASURES,
++    ),
++}
++
++
++def get_freq_spec(freq: str) -> FreqSpec:
++    """Return the :class:`FreqSpec` for ``freq`` ('hourly' or 'daily')."""
++    try:
++        return FREQS[freq]
++    except KeyError:
++        raise ValueError(
++            f"Unknown freq {freq!r}; expected one of {sorted(FREQS)}."
++        ) from None
++
++
++# --------------------------------- Backwards-compatible hourly aliases
++
++RAW_TO_SHORT: dict[str, str] = HOURLY_RAW_TO_SHORT
++MEASURE_COLUMNS: tuple[str, ...] = HOURLY_MEASURE_COLUMNS
++BASE_COLUMNS: tuple[str, ...] = FREQS["hourly"].base_columns
++OUTPUT_COLUMNS: tuple[str, ...] = BASE_COLUMNS + ("prec_type",)
+diff --git a/pyproject.toml b/pyproject.toml
+index c725732..cd55a1b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "local-climatological-data"
+-version = "0.2.0"
+-description = "Download, clean, and load NOAA Local Climatological Data hourly station records."
++version = "0.3.0"
++description = "Download, clean, and load NOAA Local Climatological Data hourly and daily station records."
+ readme = "README.md"
+ requires-python = ">=3.10"
+ license = { text = "MIT" }
+@@ -16,6 +16,7 @@ dependencies = [
+     "xarray>=2023.1",
+     "netCDF4>=1.6",
+     "requests>=2.28",
++    "dask>=2023.1",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -29,4 +30,4 @@ Repository = "https://github.com/Jared-Kodero/local_climatological_data"
+ packages = ["lcd"]
+ 
+ [tool.setuptools.package-data]
+-lcd = ["data/*.stations"]
++lcd = ["data/*.stations", "data/example_download/*"]

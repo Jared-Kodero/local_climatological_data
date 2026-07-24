@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-climatological-data"
-version = "0.2.0"
-description = "Download, clean, and load NOAA Local Climatological Data hourly station records."
+version = "0.3.0"
+description = "Download, clean, and load NOAA Local Climatological Data hourly and daily station records."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -16,6 +16,7 @@ dependencies = [
     "xarray>=2023.1",
     "netCDF4>=1.6",
     "requests>=2.28",
+    "dask>=2023.1",
 ]
 
 [project.optional-dependencies]
@@ -29,4 +30,4 @@ Repository = "https://github.com/Jared-Kodero/local_climatological_data"
 packages = ["lcd"]
 
 [tool.setuptools.package-data]
-lcd = ["data/*.stations"]
+lcd = ["data/*.stations", "data/example_download/*"]

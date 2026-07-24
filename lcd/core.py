@@ -1,10 +1,14 @@
 """
 User-facing entry points for NOAA Local Climatological Data.
 
-get_lcd_from_noaa   download, clean, and return records as netCDF or DataFrame
-open_dataset        load a stored file as a pandas DataFrame or xarray Dataset
-get_durations       per-station precipitation-event durations (savable)
-get_lag             within-day lagged predictors (savable)
+get_lcd_from_noaa   download and clean records, returning an xarray Dataset
+open_dataset        load a stored netCDF as an xarray Dataset
+get_durations       per-station precipitation-event durations
+get_lag             within-day lagged predictors
+save_dataset        write a Dataset to compressed netCDF
+
+All routines return :class:`xarray.Dataset` objects. Records are indexed by
+(station, time); the station coordinate holds the NOAA identifier as a string.
 """
 
 from __future__ import annotations
@@ -24,15 +28,19 @@ from .download import (
     open_xarray,
     read_netcdf,
     to_netcdf,
+    to_xarray,
 )
-from .schema import BASE_URL, LAGGABLE_COLUMNS, STATIONS_FILE
+from .schema import BASE_URL, LAGGABLE_COLUMNS, STATIONS_FILE, get_freq_spec
 
 __all__ = [
     "get_lcd_from_noaa",
     "open_dataset",
+    "save_dataset",
     "get_durations",
     "get_lag",
 ]
+
+Freq = Literal["hourly", "daily"]
 
 
 # ------------------------------------------------------------- Retrieval
@@ -45,9 +53,9 @@ def get_lcd_from_noaa(
     lat_max: float,
     min_year: int,
     max_year: int,
+    freq: Freq = "hourly",
     months: Optional[Sequence[int]] = None,
     classify_convective: bool = True,
-    engine: Literal["pandas", "netcdf"] = "netcdf",
     *,
     country: Optional[str] = "US",
     min_year_range: int = 1,
@@ -57,40 +65,38 @@ def get_lcd_from_noaa(
     scheduler: Literal["processes", "threads"] = "processes",
     add_cities: bool = False,
     keep_raw: bool = False,
-) -> xr.Dataset | pd.DataFrame:
+    output: Optional[Union[str, Path]] = None,
+) -> xr.Dataset:
     """Retrieve NOAA Local Climatological Data for a geographic region.
 
-    Download station-year LCD files from NOAA, clean and subset the hourly
-    observations, and return the result as either a pandas DataFrame or an
-    xarray Dataset. Records are restricted by geographic bounds, calendar
-    years, country, and optionally calendar month.
+    Download station-year LCD files from NOAA, retain only the records matching
+    the requested temporal frequency, clean and convert them to SI units, and
+    return an :class:`xarray.Dataset` with dimensions (station, time).
 
     Parameters
     ----------
     lon_min, lon_max : float
-        Western and eastern longitude bounds, respectively, in decimal
-        degrees east. Longitudes west of the prime meridian are negative.
+        Western and eastern longitude bounds, respectively, in decimal degrees
+        east. Longitudes west of the prime meridian are negative.
     lat_min, lat_max : float
-        Southern and northern latitude bounds, respectively, in decimal
-        degrees north.
+        Southern and northern latitude bounds, respectively, in decimal degrees
+        north.
     min_year, max_year : int
         First and last calendar years to include. Both bounds are inclusive.
+    freq : {"hourly", "daily"}, default "hourly"
+        Temporal frequency to retain. ``"hourly"`` keeps surface hourly and
+        synoptic reports (FM-12, FM-15, FM-16) and returns the hourly variable
+        set; ``"daily"`` keeps Summary of Day (SOD) rows and returns the daily
+        summary variable set. Records belonging to the other frequency, and all
+        monthly and normals rows, are discarded.
     months : sequence of int, optional
         Calendar months to retain, expressed as integers from 1 through 12.
-        Filtering is applied during data cleaning to reduce memory use. If
-        None, retain all months.
+        Filtering is applied during cleaning to reduce memory use. If None,
+        retain all months.
     classify_convective : bool, default True
         Whether to classify precipitation observations and add the resulting
-        ``prec_type`` variable or column.
-    engine : {"pandas", "netcdf"}, default "netcdf"
-        Output representation. ``"pandas"`` returns a
-        :class:`pandas.DataFrame`; ``"netcdf"`` converts the cleaned records
-        to an :class:`xarray.Dataset`.
-    outfile : str or pathlib.Path, optional
-        Output path. For the pandas engine, the data are written as CSV using
-        a ``.csv`` suffix. For the netCDF engine, this path is passed to the
-        netCDF conversion routine. Parent directories are created
-        automatically. If None, no CSV file is written.
+        ``prec_type`` variable. Applies to ``freq="hourly"`` only; ignored for
+        daily summaries, which carry no sub-daily present-weather groups.
     country : str, optional, default "US"
         Country code used to restrict the station inventory. Set to None to
         disable country filtering.
@@ -98,35 +104,38 @@ def get_lcd_from_noaa(
         Minimum number of years for which a station must satisfy the requested
         temporal coverage criteria.
     stations_file : str or pathlib.Path, default STATIONS_FILE
-        Path to the station inventory used to identify stations within the
-        requested region.
+        Path to the station inventory used to identify stations in the region.
     base_url : str, default BASE_URL
         Base URL from which NOAA LCD station-year files are downloaded.
     workers : int, default 8
         Maximum number of concurrent workers used for downloading and cleaning.
         Values less than one are treated as one worker.
     scheduler : {"processes", "threads"}, default "processes"
-        Dask scheduler used for parallel data-cleaning tasks.
+        Dask scheduler used for parallel download and cleaning tasks.
     add_cities : bool, default False
-        Whether to add ``city`` and ``state`` fields based on the station
-        coordinates.
+        Whether to overwrite ``city`` and ``state`` using the nearest Natural
+        Earth populated place rather than the LCD station name.
     keep_raw : bool, default False
         Whether to retain downloaded source files after processing.
+    output : str or pathlib.Path, optional
+        If given, the Dataset is additionally written to this path as
+        compressed netCDF. Parent directories are created automatically.
 
     Returns
     -------
-    pandas.DataFrame
-        Cleaned LCD observations when ``engine="pandas"``.
     xarray.Dataset
-        Cleaned LCD observations converted to an xarray Dataset when
-        ``engine="netcdf"``.
+        Cleaned LCD records with dimensions (station, time). Latitude,
+        longitude, elevation, city, and state are coordinates along the station
+        dimension.
 
     Notes
     -----
-    The function may perform network requests and create files or directories
-    on disk. Temporal filtering is applied after station selection and during
-    cleaning of the downloaded observations.
+    Hourly timestamps are converted from Local Standard Time to UTC. Daily
+    summaries are keyed by their Local Standard calendar date and are not
+    shifted. The function performs network requests and creates temporary files
+    on disk.
     """
+    spec = get_freq_spec(freq)
     region = Region(
         lat_min,
         lat_max,
@@ -144,59 +153,80 @@ def get_lcd_from_noaa(
         workers=workers,
         classify=classify_convective,
         months=months,
+        freq=spec.name,
         keep_raw=keep_raw,
         scheduler=scheduler,
     )
     if add_cities:
         df = add_city_names(df)
 
-    return to_netcdf(df, engine)
+    ds = to_xarray(df)
+    ds.attrs["frequency"] = spec.name
+    if output is not None:
+        to_netcdf(ds, output)
+    return ds
 
 
 # ---------------------------------------------------------------- Loading
 
 
-def open_dataset(
-    path: Union[str, Path],
-    engine: Literal["pandas", "netcdf"] = "pandas",
-) -> Union[pd.DataFrame, xr.Dataset]:
-    """Load a stored LCD netCDF file.
+def open_dataset(path: Union[str, Path]) -> xr.Dataset:
+    """Load a stored LCD netCDF file as an xarray Dataset.
 
     Parameters
     ----------
-    path : str or Path
-        Path to a netCDF file written by :func:`get_lcd_from_noaa`.
-    engine : {"pandas", "netcdf"}, default "pandas"
-        "pandas" returns a long DataFrame (padding removed); "netcdf" returns
-        the decoded (station, time) xarray Dataset.
+    path : str or pathlib.Path
+        Path to a netCDF file written by :func:`get_lcd_from_noaa` or
+        :func:`save_dataset`.
+
+    Returns
+    -------
+    xarray.Dataset
+        Decoded (station, time) Dataset. Categorical fields stored as integer
+        codes are decoded back to strings on read.
     """
     path = Path(path)
     if not path.exists():
         raise DataNotFoundError(f"File not found: {path}")
-    if engine == "pandas":
-        return read_netcdf(path)
-    if engine == "netcdf":
-        return open_xarray(path)
-    raise ValueError(f"Unknown engine: {engine!r}")
+    return open_xarray(path)
+
+
+def save_dataset(ds: xr.Dataset, path: Union[str, Path]) -> Path:
+    """Write a Dataset to compressed netCDF and return the path."""
+    return to_netcdf(ds, path)
 
 
 # ------------------------------------------------------ Event durations
 
 
 def get_durations(
-    data: Union[pd.DataFrame, str, Path],
+    data: Union[xr.Dataset, str, Path],
     gap_tolerance_hours: float = 1.0,
     sampling_interval_hours: float = 1.0,
     output: Optional[Union[str, Path]] = None,
-) -> Union[pd.DataFrame, Path]:
+) -> xr.Dataset:
     """Per-station precipitation-event durations, in minutes.
 
-    An event is a contiguous run of prec > 0; a gap exceeding
+    An event is a contiguous run of ``prec > 0``; a gap exceeding
     ``gap_tolerance_hours`` terminates it. Duration is
-    n_obs * sampling_interval_hours * 60, each observation representing one
+    ``n_obs * sampling_interval_hours * 60``, each observation representing one
     accumulation interval (Eagleson 1972; Restrepo-Posada and Eagleson 1982).
-    When ``output`` is given the result is written to netCDF and its path
-    returned; otherwise a DataFrame with a 'duration' column is returned.
+
+    Parameters
+    ----------
+    data : xarray.Dataset, str, or pathlib.Path
+        An hourly LCD Dataset or a path to a stored netCDF file.
+    gap_tolerance_hours : float, default 1.0
+        Maximum gap, in hours, tolerated within a single event.
+    sampling_interval_hours : float, default 1.0
+        Accumulation interval represented by each observation, in hours.
+    output : str or pathlib.Path, optional
+        If given, the result is additionally written to this path.
+
+    Returns
+    -------
+    xarray.Dataset
+        Input variables plus a ``duration`` variable, in minutes.
     """
     df = _as_frame(data)
     parts = [
@@ -205,40 +235,65 @@ def get_durations(
     ]
     out = pd.concat(parts, ignore_index=True)
     out = out.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
+    ds = to_xarray(out)
+    ds["duration"].attrs.update(long_name="Precipitation Event Duration", units="min")
     if output is not None:
-        return to_netcdf(out, output)
-    return out
+        to_netcdf(ds, output)
+    return ds
 
 
 # ------------------------------------------------------------ Lagging
 
 
 def get_lag(
-    data: Union[pd.DataFrame, str, Path],
+    data: Union[xr.Dataset, str, Path],
     lag: int = 1,
     output: Optional[Union[str, Path]] = None,
-) -> Union[pd.DataFrame, Path]:
+) -> xr.Dataset:
     """Within-day lag of thermodynamic and kinematic variables.
 
-    Lagging is applied per (station_id, calendar day) so values never cross
-    day boundaries; mid-day gaps are forward-filled within day. When
-    ``output`` is given the result is written to netCDF and its path returned.
+    Lagging is applied per (station_id, calendar day) so values never cross day
+    boundaries; mid-day gaps are forward-filled within the day.
+
+    Parameters
+    ----------
+    data : xarray.Dataset, str, or pathlib.Path
+        An LCD Dataset or a path to a stored netCDF file.
+    lag : int, default 1
+        Number of observations to lag by.
+    output : str or pathlib.Path, optional
+        If given, the result is additionally written to this path.
+
+    Returns
+    -------
+    xarray.Dataset
+        Dataset with the laggable variables replaced by their lagged values.
     """
     df = _as_frame(data)
     parts = [_apply_lag(g, lag=lag) for _, g in df.groupby("station_id")]
     out = pd.concat(parts, ignore_index=True)
     out = out.sort_values(["time", "lat", "lon"]).reset_index(drop=True)
+    ds = to_xarray(out)
+    ds.attrs["lag"] = lag
     if output is not None:
-        return to_netcdf(out, output)
-    return out
+        to_netcdf(ds, output)
+    return ds
 
 
 # ============================== Internal helpers ===========================
 
 
-def _as_frame(data: Union[pd.DataFrame, str, Path]) -> pd.DataFrame:
+def _as_frame(data: Union[xr.Dataset, str, Path, pd.DataFrame]) -> pd.DataFrame:
+    """Normalise Dataset, path, or frame input to a long DataFrame."""
     if isinstance(data, pd.DataFrame):
         return data
+    if isinstance(data, xr.Dataset):
+        df = data.to_dataframe().reset_index()
+        if "station" in df.columns:
+            df = df.rename(columns={"station": "station_id"})
+        if "prec" in df.columns:
+            df = df.dropna(subset=["prec"])
+        return df.reset_index(drop=True)
     return read_netcdf(data)
 
 

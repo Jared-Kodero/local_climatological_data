@@ -20,13 +20,15 @@ SI on ingest.
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
 
 # ----------------------------------------------------------------- Endpoints
 
-TMP = Path("/tmp")  # node-local scratch
+# Default scratch location (honours TMPDIR/TEMP/TMP and works on every platform).
+TMP = Path(tempfile.gettempdir())
 
 # Packaged data (station inventory and example download).
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -218,6 +220,12 @@ UNITS: dict[str, str] = {
     "cdd": "degF-day",
 }
 
+# Units that differ from ``UNITS`` for a given frequency. Hourly precipitation is
+# the amount reported over the preceding hour (mm/hr); a daily value is a total.
+UNITS_BY_FREQ: dict[str, dict[str, str]] = {
+    "daily": {"prec": "mm"},
+}
+
 LONG_NAMES: dict[str, str] = {
     "time": "Observation Time",
     "station_id": "NOAA Station Identifier",
@@ -271,11 +279,16 @@ CONVECTIVE_CODES: dict[str, frozenset[str]] = {
 }
 
 
-def variable_attrs(name: str) -> dict[str, str]:
-    """Return CF-style attributes (units, long_name) for a variable."""
+def variable_attrs(name: str, freq: Optional[str] = None) -> dict[str, str]:
+    """Return CF-style attributes (units, long_name) for a variable.
+
+    ``freq`` ('hourly' or 'daily') selects frequency-specific units where they
+    differ (daily precipitation is a total in mm, hourly precipitation is mm/hr).
+    """
     attrs: dict[str, str] = {}
-    if name in UNITS:
-        attrs["units"] = UNITS[name]
+    units = UNITS_BY_FREQ.get(freq or "", {}).get(name, UNITS.get(name))
+    if units is not None:
+        attrs["units"] = units
     if name in LONG_NAMES:
         attrs["long_name"] = LONG_NAMES[name]
     return attrs

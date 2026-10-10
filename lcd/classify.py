@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .schema import CONVECTIVE_CODES, WEATHER_COLUMNS
@@ -43,14 +44,23 @@ def convective_mask(
     Series[bool]
     """
     codes = codes or CONVECTIVE_CODES
-    mask = pd.Series(False, index=df.index)
+    mask = np.zeros(len(df), dtype=bool)
     for group in WEATHER_COLUMNS:
         if group not in df.columns:
             continue
         group_codes = codes.get(group, frozenset())
-        tokens = df[group].fillna("").astype(str).str.split()
-        mask |= tokens.apply(lambda toks: not group_codes.isdisjoint(toks))
-    return mask
+        if not group_codes:
+            continue
+        # Present-weather groups repeat a small vocabulary over many rows, so
+        # each distinct string is tested once and the result broadcast.
+        labels, uniques = pd.factorize(df[group].fillna("").astype(str))
+        hit = np.fromiter(
+            (not group_codes.isdisjoint(u.split()) for u in uniques),
+            dtype=bool,
+            count=len(uniques),
+        )
+        mask |= hit[labels]
+    return pd.Series(mask, index=df.index)
 
 
 def precip_type(

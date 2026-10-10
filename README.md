@@ -15,10 +15,14 @@ options have been removed; use `Dataset.to_dataframe()` if a frame is required.
 ```bash
 pip install -e .
 pip install -e ".[cities]"   # optional: cartopy-based city assignment
+pip install -e ".[test]"     # optional: pytest, to run the test suite
 ```
 
-Core requirements: numpy, pandas, xarray, netCDF4, dask, requests. The station
-inventory ships in `lcd/data/airports.stations`.
+Core requirements: numpy, pandas, xarray, netCDF4, dask, requests (Python 3.10
+or later). The station inventory ships in `lcd/data/airports.stations`. The test
+suite passes with the minimum declared versions (Python 3.11, pandas 2.0,
+xarray 2023.1, dask 2023.1) and with current releases (Python 3.13, pandas
+2.2 and 3.0).
 
 ## Example download
 
@@ -58,10 +62,40 @@ ds = lcd.get_lcd_from_noaa(
     months=[6, 7, 8],           # optional calendar-month filter
     classify_convective=True,   # adds a 'prec_type' variable (hourly only)
     output="lcd.nc",            # optional: also write compressed netCDF
+    progress=True,              # download/cleaning progress on stderr
 )
 ```
 
-Returns an `xarray.Dataset` with dimensions `(station, time)`.
+Returns an `xarray.Dataset` with dimensions `(station, time)`. `months` must be
+a non-empty sequence of integers from 1 to 12; invalid values raise
+`ValueError` before anything is downloaded. `lcd.EmptyDataFrameError` is raised
+if no station matches the region, no file could be downloaded, or no record
+remains after cleaning.
+
+### Station selection and file names
+
+Stations are chosen from the packaged inventory by bounding box, `country`
+(default `"US"`), and overlap of their period of record with
+`min_year`-`max_year`. `min_year_range` is the minimum length of that period
+of record (last year minus first year). NOAA names each file
+`<year>/<USAF><WBAN>.csv`, with USAF padded to 6 and WBAN to 5 characters; the
+inventory stores both without leading zeros, so the identifiers are
+zero-padded before requesting (for example USAF 701337 with WBAN 103 is
+requested as `70133700103`). Version 0.3.0 did not pad, which made roughly one
+in eight US inventory stations (925 of 7,170) fail with a silent 404.
+
+### Parallelism
+
+Downloads are network-bound and run on a pool of at least 16 threads, one
+keep-alive session per thread. Cleaning is CPU-bound and runs on a Dask process
+pool (`scheduler="processes"`, the default) limited to the available CPUs and
+used only for 24 or more files; smaller requests are cleaned in-process because
+starting the pool takes longer than the work. `workers=1` always cleans
+serially. Scripts that reach the process pool must guard their entry point with
+`if __name__ == "__main__":`, as required by Python's `spawn` start method;
+use `scheduler="threads"` to avoid this. Failed downloads (after four retries)
+are logged as warnings and, if any occur, a final warning reports that the
+result is incomplete.
 
 ### Selecting the temporal frequency
 
@@ -80,6 +114,12 @@ ds_daily  = lcd.get_lcd_from_noaa(..., freq="daily")
 
 Daily summaries carry no sub-hourly present-weather groups, so
 `classify_convective` is ignored when `freq="daily"`.
+
+Hourly records that report no precipitation value are discarded, so the hourly
+dataset contains only observations with a precipitation amount (including
+`0.00`). The `months` filter uses the UTC timestamp for hourly data and the
+Local Standard date for daily data. Hourly UTC timestamps near a year boundary
+can fall in the adjacent calendar year.
 
 ### open_dataset and save_dataset
 
@@ -175,6 +215,17 @@ the cloud base height in hundreds of feet. Up to three layers are reported.
 pressure increase over the previous three hours, 4 no change, and 5-8 a net
 decrease.
 
+Sign of `pchg` (data caveat). The NCEI documentation states that the 3-hour net
+change is prefixed with `+` for an increase and `-` for a decrease. In the
+shipped example file (JAN MAYEN, 2025) the reported sign is the opposite: across
+1,501 pairs of reports exactly three hours apart (reported change larger than
+0.015 inHg in magnitude) the correlation between the reported change and the
+actual change in station pressure is -0.99, while `ptend` agrees with the actual
+direction (codes 0-3 average -0.034 inHg, codes 5-8 average +0.033 inHg). The
+package converts the reported value and does not alter its sign. This has been
+checked for one station only; until the convention is confirmed for the stations
+of interest, derive the change from `stp` or `sp`, or use `ptend` for direction.
+
 ### Daily (`freq="daily"`)
 
 | Short | Long name | Units | Source column |
@@ -228,6 +279,18 @@ UTC = LST - offset
 and applied per station. Daily summaries describe a Local Standard calendar day
 and are therefore normalised to that date without a UTC shift.
 
+The longitude rule reproduces the timestamps of the shipped example (Jan Mayen,
+FM-12 synoptic reports): after conversion 65% of its reports fall on a synoptic
+hour (00, 03, 06, ... UTC), against 17% if the legal offset of UTC+1 were used.
+It is not the legal standard offset for every US station, however: it gives
+-6 h for Atlanta Hartsfield (-84.44 degrees; legal EST -5 h), -6 h for Detroit
+Metro (-83.33 degrees; EST -5 h), -4 h for Eastport, Maine (-67.01 degrees; EST
+-5 h) and -10 h for Anchorage (-150.03 degrees; AKST -9 h). Whether NCEI's own
+Local Standard Time for US stations follows the legal offset or this rule has
+not been verified here. To check a station, compare the `Sunrise` and `Sunset`
+columns of a downloaded file (Local Standard Time) with astronomical solar noon
+for its coordinates; the two candidate offsets differ by a full hour.
+
 ## netCDF structure
 
 Files are written as a CF `timeSeries` dataset with dimensions
@@ -236,9 +299,26 @@ preserving leading zeros. Latitude, longitude, elevation, city, and state are
 coordinates along the station dimension; measurement variables are stored as
 float32 with zlib compression. String fields are stored compactly: `prec_type`
 as a CF int8 flag variable and the remaining categorical fields (au, aw, mw,
-skyc, wt) as int16 codes with a JSON category table, all decoded back to strings
-on read. Station identifiers and observation times are unique along their
+skyc, wt) as integer codes with a JSON category table, all decoded back to
+strings on read. Codes are int16 for up to 32,768 distinct values and widen to
+int32 beyond that; version 0.3.0 always used int16, which silently corrupted
+fields with more distinct values (sky condition strings can exceed this in
+large requests). Station identifiers and observation times are unique along their
 dimensions.
+
+## Development
+
+```bash
+pip install -e ".[test]"
+pytest                                   # offline; downloads use a local mock server
+python benchmarks/bench.py --data /tmp/lcd_bench --stations 16 --workers 4
+```
+
+The tests need no network access: station files are synthesised in the NCEI
+layout and served from a local HTTP server. `benchmarks/bench.py` times each
+stage (cleaning, reshaping, netCDF I/O, durations, lag, downloads) on synthetic
+station-years and reuses the generated files between runs so that two versions
+can be compared on identical input. See `CHANGELOG.md` for measured speed-ups.
 
 ## References
 

@@ -4,3 +4,7 @@ __pycache__/
 build/
 dist/
 .ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+*.nc

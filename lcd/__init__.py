@@ -69,7 +69,7 @@ from .download import (
 )
 from .schema import FREQS, EXAMPLE_DIR, get_freq_spec
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "get_lcd_from_noaa",

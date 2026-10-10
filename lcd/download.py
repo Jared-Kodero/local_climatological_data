@@ -119,6 +119,10 @@ def _validate_months(months: Optional[Sequence[int]]) -> Optional[tuple[int, ...
 
 # ============================== Station selection ==========================
 
+# Stations whose inventory END date lies within this many days of the newest
+# END date in the inventory (the snapshot date) are assumed still active.
+_ACTIVE_WINDOW_DAYS = 90
+
 
 def select_stations(
     region: Region,
@@ -144,6 +148,17 @@ def select_stations(
     for col in ("LAT", "LON"):
         inv[col] = pd.to_numeric(inv[col], errors="coerce")
 
+    # The inventory is a snapshot: a station still reporting when it was built
+    # has an END date at (or within days of) the snapshot date, not its true
+    # last year. Such stations are treated as active through the current year;
+    # otherwise no request for years after the snapshot could match a station.
+    end_date = pd.to_datetime(inv["END"], format="%Y%m%d", errors="coerce")
+    if end_date.notna().any():
+        cutoff = end_date.max() - pd.Timedelta(days=_ACTIVE_WINDOW_DAYS)
+        inv["_active"] = (end_date >= cutoff).to_numpy()
+    else:
+        inv["_active"] = False
+
     mask = inv["LAT"].between(region.lat_min, region.lat_max) & inv["LON"].between(
         region.lon_min, region.lon_max
     )
@@ -155,6 +170,9 @@ def select_stations(
     inv["end"] = pd.to_numeric(inv["END"].str[:4], errors="coerce")
     inv = inv.dropna(subset=["begin", "end"])
     inv[["begin", "end"]] = inv[["begin", "end"]].astype(int)
+    active = inv["_active"].astype(bool)
+    inv.loc[active, "end"] = np.maximum(inv.loc[active, "end"], pd.Timestamp.now().year)
+    inv = inv.drop(columns="_active")
     inv = inv[(inv["end"] - inv["begin"]) >= region.min_year_range]
     inv = inv[(inv["begin"] <= region.end_year) & (inv["end"] >= region.start_year)]
 
@@ -210,6 +228,18 @@ class _Progress:
             sys.stderr.flush()
 
 
+# Transport failures worth re-requesting: dropped connections, timeouts, and
+# bodies cut short mid-transfer. HTTP errors are not retried here (the session's
+# Retry has already handled 429/5xx; other 4xx are permanent).
+_TRANSIENT_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+_TRANSFER_ATTEMPTS = 4
+_TRANSFER_BACKOFF = 0.5
+
+
 def _download_one(
     session: requests.Session,
     base_url: str,
@@ -222,21 +252,33 @@ def _download_one(
     url = f"{base_url}/{year}/{station_id}.csv"
     dest = out_dir / str(year) / f"{station_id}.csv"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with session.get(url, stream=True, timeout=timeout) as resp:
-            if resp.status_code == 404:
-                return "missing"
-            resp.raise_for_status()
-            with open(dest, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=1 << 16):
-                    if chunk:
-                        fh.write(chunk)
-        return "ok"
-    except (requests.RequestException, OSError) as exc:
-        if dest.exists():
-            dest.unlink()
-        logger.warning("download failed %s: %s", url, exc)
-        return "error"
+    exc: Optional[Exception] = None
+    for attempt in range(_TRANSFER_ATTEMPTS):
+        try:
+            with session.get(url, stream=True, timeout=timeout) as resp:
+                if resp.status_code == 404:
+                    return "missing"
+                resp.raise_for_status()
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1 << 16):
+                        if chunk:
+                            fh.write(chunk)
+            return "ok"
+        except _TRANSIENT_ERRORS as e:
+            # The session's Retry only covers connection set-up and bad status
+            # codes; a body cut off mid-transfer must be re-requested here.
+            exc = e
+            if dest.exists():
+                dest.unlink()
+            if attempt + 1 < _TRANSFER_ATTEMPTS:
+                time.sleep(_TRANSFER_BACKOFF * 2**attempt)
+        except (requests.RequestException, OSError) as e:
+            exc = e
+            if dest.exists():
+                dest.unlink()
+            break
+    logger.warning("download failed %s: %s", url, exc)
+    return "error"
 
 
 def download_stations(

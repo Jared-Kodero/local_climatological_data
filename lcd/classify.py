@@ -52,10 +52,17 @@ def convective_mask(
         if not group_codes:
             continue
         # Present-weather groups repeat a small vocabulary over many rows, so
-        # each distinct string is tested once and the result broadcast.
+        # each distinct string is tested once and the result broadcast. Tokens
+        # may carry a light (-) or heavy (+) intensity prefix (e.g. '+TS:7'),
+        # so both the token and the token without that prefix are tested.
         labels, uniques = pd.factorize(df[group].fillna("").astype(str))
         hit = np.fromiter(
-            (not group_codes.isdisjoint(u.split()) for u in uniques),
+            (
+                not group_codes.isdisjoint(
+                    t for tok in u.split() for t in (tok, tok.lstrip("+-"))
+                )
+                for u in uniques
+            ),
             dtype=bool,
             count=len(uniques),
         )

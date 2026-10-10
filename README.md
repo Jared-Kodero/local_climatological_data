@@ -84,6 +84,14 @@ zero-padded before requesting (for example USAF 701337 with WBAN 103 is
 requested as `70133700103`). Version 0.3.0 did not pad, which made roughly one
 in eight US inventory stations (925 of 7,170) fail with a silent 404.
 
+The packaged inventory is a snapshot (newest END date 2023-09-08). A station
+whose END date lies within 90 days of the snapshot was still reporting when it
+was built, so its period of record is treated as open-ended through the current
+calendar year. Years in which such a station has no published file return HTTP
+404 and are counted as not published. Stations that ended earlier keep their
+inventory END year. Without this rule, no request for 2024 or later could match
+any station.
+
 ### Parallelism
 
 Downloads are network-bound and run on a pool of at least 16 threads, one
@@ -93,8 +101,8 @@ used only for 24 or more files; smaller requests are cleaned in-process because
 starting the pool takes longer than the work. `workers=1` always cleans
 serially. Scripts that reach the process pool must guard their entry point with
 `if __name__ == "__main__":`, as required by Python's `spawn` start method;
-use `scheduler="threads"` to avoid this. Failed downloads (after four retries)
-are logged as warnings and, if any occur, a final warning reports that the
+use `scheduler="threads"` to avoid this. Failed downloads (after four retries,
+including bodies cut off mid-transfer) are logged as warnings and, if any occur, a final warning reports that the
 result is incomplete.
 
 ### Selecting the temporal frequency
